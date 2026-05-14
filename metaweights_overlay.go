@@ -32,8 +32,12 @@ var (
 	metaCoeffsTrained    = MetaCoeffs{Heb: 0.6, Pro: 0.4, Ds: 0.3, Bg: 5.0, Tg: 3.0}
 )
 
-// Q's transformer-magnitude gate threshold (postgpt_q.c:1356).
-const metaTFGateThreshold = 0.1
+// Transformer-magnitude gate threshold for switching weightless → trained
+// coefficient bundles. Postgpt_q.c:1356 uses 0.1 (raw untrained wte). Molequla
+// seeds wte from metaweights (postgpt.c:541-574) which lifts mean|logit| to
+// ~0.25 even at zero training, so 0.1 is too low — keep weightless coeffs in
+// force until real training raises mag past 1.0 (smooth gate at tg=0.5).
+const metaTFGateThreshold = 1.0
 
 // MetaweightsOverlay applies the Q-style dynamic logit overlay in place on
 // `logits` (model's raw pre-temperature logits over the vocabulary).
@@ -81,6 +85,22 @@ func MetaweightsOverlay(
 	coeffs := metaCoeffsWeightless
 	if tmag > metaTFGateThreshold {
 		coeffs = metaCoeffsTrained
+	}
+
+	// 1.5. Transformer gate — silence untrained transformer logits before overlay.
+	// Mirror of pitomadom.c:583-586 / q/README.md:31 — Q's signature trick that
+	// lets metaweights drive coherence at zero training. Untrained: mean|logit|
+	// ~0.1-0.5 → tg≈0 → transformer logits zeroed → overlay owns the signal.
+	// Trained: mean|logit| ~2.0+ → tg≈1 → transformer speaks, overlay fades to
+	// its trained-mode small coefficients (already picked above).
+	tg := (tmag - 0.5) / 1.5
+	if tg < 0 {
+		tg = 0
+	} else if tg > 1 {
+		tg = 1
+	}
+	for i := range logits {
+		logits[i] *= tg
 	}
 
 	// 2. Bigram + trigram per-context — normalised probabilities.
@@ -253,17 +273,16 @@ func MetaweightsOverlayCollapse(prophecyField []float64, sampledID int) {
 	}
 }
 
-// MetaweightsRepetitionPenalty applies Q's age-graded repetition penalty +
-// bigram-blocking pass on raw logits AFTER the metaweights overlay.
-// Mirror of postgpt_q.c:1399-1408. Multiplicative penalties.
+// MetaweightsRepetitionPenalty applies postgpt's uniform repetition penalty
+// + bigram blocking on raw logits AFTER the metaweights overlay. Mirror of
+// postgpt.c:960-967 and postgpt_q.c:1407-1408.
 //
-//   - Recent tokens (last 20 of ctx): logits[t] *= 0.335 + 0.035*age
-//     where age=1 for most recent, age=20 for oldest in window.
-//     Recent gets stronger penalty (0.335 ≈ 67% damping), old weaker
-//     (0.665 ≈ 33% damping). This breaks lock-in like «Sppellllllll».
+//   - Distinct tokens in the last 12 ids: logits[t] *= 0.5. Uniform
+//     damping kills lock-in («The most of the most of the most...») by
+//     suppressing recently-emitted tokens equally, not on a graded curve
+//     that left the very last token only 33% suppressed.
 //   - Bigram blocking (cl >= 2): for every position where ctx[i]==ctx[cl-2],
-//     penalise ctx[i+1] by 0.2. Prevents re-emitting the same bigram pair
-//     just seen — kills two-token repetition cycles.
+//     penalise ctx[i+1] by 0.2. Kills two-token cycles.
 //
 // Logits are mutated in place.
 func MetaweightsRepetitionPenalty(logits []float64, ids []int) {
@@ -272,19 +291,20 @@ func MetaweightsRepetitionPenalty(logits []float64, ids []int) {
 	if V == 0 || cl == 0 {
 		return
 	}
-	// Age-graded penalty over last 20 ctx tokens.
-	start := cl - 20
+	// Uniform multiplicative penalty over last 12 ctx tokens.
+	start := cl - 12
 	if start < 0 {
 		start = 0
 	}
+	seen := make(map[int]bool, 12)
 	for ri := cl - 1; ri >= start; ri-- {
-		if ids[ri] >= 0 && ids[ri] < V {
-			age := float64(cl - ri) // 1 = just seen, 20 = oldest in window
-			pen := 0.3 + 0.035*age
-			logits[ids[ri]] *= pen
+		t := ids[ri]
+		if t >= 0 && t < V && !seen[t] {
+			logits[t] *= 0.5
+			seen[t] = true
 		}
 	}
-	// Bigram blocking — Q postgpt_q.c:1407-1408.
+	// Bigram blocking — postgpt_q.c:1407-1408.
 	if cl >= 2 {
 		last := ids[cl-2]
 		for ri := 0; ri < cl-1; ri++ {

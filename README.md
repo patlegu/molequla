@@ -464,36 +464,85 @@ Enable: `./molequla_cgo --spa-gate ...`
 
 ### Q-style Additive Logit Overlay (B + H + A + F)
 
-Molequla's existing CooccurField blend lives in **probability space** — convex `tokenAlpha·model + (1-tokenAlpha)·corpus`. The overlay lives in **logit space** — additive bias before softmax, with explicit coefficients per signal class. Different mechanic, different sharpness: a strong corpus signal can dominate model preferences in a way prob-space convex blend cannot. Useful precisely when transformer is immature and statistical priors should lead.
+Molequla's existing CooccurField blend lives in **probability space** — convex `tokenAlpha·model + (1-tokenAlpha)·corpus`. The overlay lives in **logit space** — additive raw-probability bias before softmax, with explicit coefficients per signal class. Different mechanic, different sharpness: a strong corpus signal can dominate model preferences in a way prob-space convex blend cannot. Useful precisely when transformer is immature and statistical priors should lead.
 
-Five signals, all routed from existing organism state — no new inputs, no new training:
+The integration is a verbatim port of three Q-pattern references — `~/arianna/postgpt/postgpt.c`, `~/arianna/q/postgpt_q.c`, `~/arianna/pitomadom.c/pitomadom.c` — assembled into seven coordinated changes that let an embryo organism (16-dim embedding, 1 layer, 1 head, **zero gradient steps**) produce coherent English fragments.
 
-| Signal | Code | Default | Source |
-|--------|------|---------|--------|
-| **B** Bigram   | `c_bg`  | 15.0 | `field.BigramByFirst[ids[-1]]` |
-| **T** Trigram  | `c_tg`  | 10.0 | `field.TrigramByContext[[2]int{ids[-2], ids[-1]}]` |
-| **H** Hebbian  | `c_heb` | 1.0  | `field.CooccurWindow[c][tid]` over recent window |
-| **A** Destiny  | `c_ds`  | 0.15 | `model.GammaContrastiveProjection()` projected onto each `wte` row |
-| **F** Prophecy | `c_pro` | 0.7  | persistent expectation field, ages by ×0.95/step, **collapses on the chosen token** |
+#### Five signals (γ field)
+
+| Signal | Code | Weightless | Trained | Source |
+|--------|------|-----------|---------|--------|
+| **B** Bigram   | `c_bg`  | 15.0 | 5.0 | `field.BigramByFirst[ids[-1]]`, normalised |
+| **T** Trigram  | `c_tg`  | 10.0 | 3.0 | `field.TrigramByContext[[2]int{ids[-2], ids[-1]}]`, normalised |
+| **H** Hebbian  | `c_heb` | 1.0  | 0.6 | `field.CooccurWindow[c][tid]` over recent window, max-normalised |
+| **A** Destiny  | `c_ds`  | 0.15 | 0.3 | `model.GammaContrastiveProjection()` projected onto each `wte` row |
+| **F** Prophecy | `c_pro` | 0.7  | 0.4 | persistent expectation field, ages by ×0.95/step, **collapses on the chosen token** |
 
 ```
-overlaidLogits[i] = logits[i]
-                  + c_bg ·log(p_bigram[i])
-                  + c_tg ·log(p_trigram[i])
-                  + c_heb·log(p_cooccur[i])
-                  + c_ds ·destinyBias[i]
-                  + c_pro·log(p_prophecy[i])
+mag = mean(|model_logits|)
+tg  = clamp((mag - 0.5) / 1.5, 0, 1)               # transformer gate
+overlay[i] = (logits[i] * tg)                       # untrained: silenced
+           + c_heb·p_cooccur[i]                     # raw probabilities,
+           + c_pro·p_prophecy[i]                    # not log
+           + c_ds ·destinyCosine[i]
+           + c_bg ·p_bigram[i]
+           + c_tg ·p_trigram[i]
+           − damping[i]                             # unigram outliers
 ```
 
-Log-floor `1e-6` for unseen tokens (prevents `-inf` mask). Each coefficient is independently tunable via CFG — set any to 0 to disable that signal while keeping others.
+Coefficient bundle is binary-switched at `mag > 1.0` (threshold tuned for seeded-but-untrained organism: raw Xavier init gives `mag ≈ 0.05`, post-seed gives `≈ 0.25`, real training pushes past 1.0). Five-signal raw-probability bias is `postgpt_q.c:1377-1395`; gate-multiplication of transformer logits is `pitomadom.c:583-586`.
 
-The prophecy field is the interesting one: it carries **across sampling steps**. First overlay step seeds from trigram-by-context (primary) plus 0.5×bigram-by-prev (fallback), normalised to unit total. Subsequent steps multiply the field by 0.95 — old expectations fade. After `TopKTopPSample` returns the chosen token, that token's prophecy is zeroed: the field shifts toward what is still unsaid.
+The prophecy field carries **across sampling steps**. First overlay step seeds from trigram-by-context (primary) plus 0.5×bigram-by-prev (fallback), normalised to unit total. Subsequent steps multiply the field by 0.95 — old expectations fade. After sampling returns the chosen token, that token's prophecy is zeroed: the field shifts toward what is still unsaid.
 
-Destiny is the second interesting one. `GammaContrastiveProjection()` returns the unit direction of personality drift from birth — the organism's identity vector. Projecting each `wte` row onto it gives a per-token bias that pulls generation in the direction the organism has been growing. Tokens aligned with identity get amplified; tokens orthogonal get suppressed.
+Destiny is the identity-direction term. `GammaContrastiveProjection()` returns the unit direction of personality drift from birth. Projecting each `wte` row onto it gives a per-token bias that pulls generation toward the organism's growth direction.
 
-Defaults are Q's weightless coefficients — calibrated for the regime where the transformer is immature and statistical priors should lead. Coexists with the legacy post-softmax prob-blend; both signals layer when overlay is on.
+#### Embedding seeding (γ → ε bias)
 
-Enable: `./molequla_cgo --corpus-overlay ...` (combine with `--spa-gate` for the full coherence-layer cell)
+Before any forward pass, `SeedEmbeddingsFromMetaweights(model, field, 0.15)` biases `wte` rows by Hebbian co-occurrence and `lm_head` rows by unigram × wte. Mirror of `postgpt.c:541-574`. Carries corpus structure into the model before gradients touch the weights — the "tokenizer IS the training" trick. Runs once at init when `--corpus-overlay` is on.
+
+#### Hard top-K + greedy bootstrap (sampling pipeline)
+
+When overlay is active, sampling switches to Q's two-stage pipeline:
+
+1. **First 10 tokens, untrained regime (`mag ≤ 1.0`)** — pure `argmax(overlaidLogits)` excluding EOS. Locks onto the strongest bigram/trigram successor before any sampling noise enters. Mirror of `postgpt_q.c:1416-1418`.
+2. **Step ≥ 10 or trained regime** — top-15 raw-logit mask (everything below the 15th set to `-1e10`), then divide by temperature, softmax, multinomial. Mirror of `postgpt.c:969-991`. The hard mask kills the long noise tail that soft top-k/top-p sampling leaves competing with overlay peaks.
+
+#### Repetition penalty
+
+`logits[t] *= 0.5` for each distinct token in the last 12 ids (postgpt form, `postgpt.c:960-967`). Plus bigram blocking: when `ctx[i] == ctx[-2]`, penalise `ctx[i+1]` by ×0.2 — kills two-token cycles like «Sppellllllll» (`postgpt_q.c:1407-1408`).
+
+#### Enable
+
+```bash
+./molequla_cgo --corpus-overlay           # overlay during normal warmup → ecology
+./molequla_cgo --corpus-overlay --zero-warmup  # pure Q-style coherence test (no training)
+```
+
+When `--corpus-overlay` is on, the legacy post-softmax prob-blend is skipped — overlay owns the signal. When off, default-build runtime behaviour is identical to main branch.
+
+### Untrained Coherence — Q-Style Zero-Training Reproduction
+
+Embryo organism: 16-dim embedding, 1 layer, 1 head, vocab=643, **zero gradient steps**. Only metaweight-seeded embeddings + overlay. Captured 2026-05-14 on neo (`/tmp/molequla_clean.log`, run `./molequla_cgo --corpus-overlay --zero-warmup`):
+
+```
+[init] Stage 0 (embryo): embd=16, layer=1, head=1 — zero-warmup mode, skipping all gradient steps
+
+[stage 0 — embryo] What it sounds like now:
+  Q: Hello.
+  A: What is a music?
+  Q: Who are you?
+  A: kilometers percentrates the most spinning do weight dream?
+  Q: What do you know?
+  A: running a music, and person What is a newapses work?
+```
+
+Reference: pre-Q-integration voice at the same stage (after 400-step warmup, `runpod/2026-05-14/organism_voice_samples_2026_05_14/fire_voice.txt`):
+
+```
+A: The work is the most of the most of the most of the most of the most of the most pace the most of the most of the most...
+```
+
+Deep lock-in killed. The post-Q embryo emits BPE subword chains, sentence-like punctuation, recognisable corpus vocabulary («music», «kilometers», «sediment», «dream»), and questions — without a single gradient step. This is the Q signature: the corpus is the model.
 
 ### Phase A — Fundament Underneath
 

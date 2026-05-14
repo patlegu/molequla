@@ -63,6 +63,7 @@ molequla_ckpt.json
 # Go build artifacts
 macrogpt_bin
 /molequla
+/molequla_cgo
 
 # Rust build artifacts
 /target/

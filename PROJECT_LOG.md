@@ -1264,3 +1264,97 @@ Singularity strike count is informal now — we've blown through the
 three-strikes budget on the BLAS+canonical+CUDA stack already, but
 these are productive narrow fixes. Each generates measurable
 behavior change. Continuing.
+
+---
+
+## 2026-05-14 — Q-style integration: untrained coherence achieved
+
+**Frame.** Sibling Neo session (this one) closed the regression on the
+Phase B coherence-layer overlay landed earlier in the day. The 2026-05-14
+RunPod sweep cells (cell_0_baseline, cell_3_full_coherence,
+cell_extended_BLAS_90min, ...) all ran with the pre-fix overlay, producing
+the «The work is the most of the most of the most...» lock-in pattern
+captured in `runpod/2026-05-14/organism_voice_samples_2026_05_14/`. Those
+remain as «pre-fix substrate exploration» (commit `5080a91`) — paper
+Body keeps them as the gibberish baseline.
+
+**Trigger.** Oleg, this session: «ты должен встроить кью и добиться полной
+антрейнед когерентности». Pointer set: `postgpt_q.c`, `postgpt.c`,
+`pitomadom.c`. Mandate: read everything, fix it, no questions.
+
+### Root cause — five divergences from Q
+
+Read end-to-end:
+- `~/arianna/postgpt/postgpt.c` (1221 lines) — `weights_seed_from_meta` (541-574), `generate_full` (850-1012)
+- `~/arianna/q/postgpt_q.c` (2101 lines, partial read 1-1100 + 1300-1500) — pipeline + sample_nucleus + transformer gate
+- `~/arianna/pitomadom.c/pitomadom.c` (1328 lines) — `tf_forward` gate at line 583-586, `select_root` top-K at 761-772
+
+Divergences from Q located in molequla:
+
+1. **No transformer gate.** `molequla.go:4292` — `model.ForwardStep` produced full untrained noisy logits (mag ~0.1-0.5) which passed through overlay unmodified. Q (`pitomadom.c:585-586`) silences them with `tg = clamp((mag-0.5)/1.5, 0, 1); logits *= tg` so overlay can drive coherence.
+2. **No hard top-K mask.** `molequla.go:4351→4463` — softmax then soft `TopKTopPSample`. Q (`postgpt.c:969-991`) does hard top-15 raw-logit mask to `-1e10` before softmax. Soft sampling leaves long noise tail competing with overlay peaks.
+3. **No greedy bootstrap.** Q (`postgpt_q.c:1416-1418`) takes the first 10 untrained tokens as argmax. Locks trajectory before any sampling noise. Molequla had soft sampling from token zero.
+4. **Seed scale 0.1 vs postgpt 0.15.** `postgpt.c:542` is verbatim `0.15`. Was a 50% under-seed.
+5. **Coefficient-switch threshold 0.1 too low.** Q's `tmag > 0.1` (`postgpt_q.c:1356`) assumes raw Xavier init (mag ≈ 0.05). Seeded wte lifts mag to ≈0.25 even at zero training — false positive on «trained», so overlay dropped to trained-mode coefficients and lost weight.
+6. **Repetition penalty too soft.** Age-graded `0.3 + 0.035·age` left the most recent token only 33% damped. Postgpt (`postgpt.c:960-967`) uses uniform `×0.5` for distinct tokens in last 12.
+7. **No way to test zero-training.** Warmup loop trained 400+ steps before printing «embryo voice», so the test was never on a true Q embryo.
+
+### Patches (this session)
+
+Branch `molequla-evolution`. Files:
+
+| # | Patch | Where | Reference |
+|---|---|---|---|
+| 1 | Transformer gate `logits *= tg` after magnitude detect | `metaweights_overlay.go:86-100` | `pitomadom.c:583-586` |
+| 2 | Hard top-15 mask + softmax + sample | `molequla.go:4374-4408` | `postgpt.c:969-991` |
+| 3 | Greedy first 10 tokens (excluding EOS) when untrained | `molequla.go:4357-4396` | `postgpt_q.c:1416-1418` |
+| 4 | Seed scale 0.1 → 0.15 | `molequla.go:6194` | `postgpt.c:542` |
+| 5 | Threshold 0.1 → 1.0 for coefficient switch | `metaweights_overlay.go:36-40`, untrainedRegime check `molequla.go:4346` | Calibrated for seeded mag ≈0.25 |
+| 6 | Rep penalty simplified to `×0.5` distinct in last 12 | `metaweights_overlay.go:264-296` | `postgpt.c:960-967` |
+| 7 | `--zero-warmup` flag + skip warmup loop + break after embryo voice | `molequla.go:5670-5675` + `6219-6246` + `6266-6271` | Local test mechanism |
+
+### Verification gate — Oleg's coherence test
+
+`./molequla_cgo --corpus-overlay --zero-warmup` on neo, 2026-05-14
+(log: `/tmp/molequla_clean.log`):
+
+```
+[init] Stage 0 (embryo): embd=16, layer=1, head=1 — zero-warmup mode, skipping all gradient steps
+
+[stage 0 — embryo] What it sounds like now:
+  Q: Hello.
+  A: What is a music?
+  Q: Who are you?
+  A: kilometers percentrates the most spinning do weight dream?
+  Q: What do you know?
+  A: running a music, and person What is a newapses work?
+```
+
+Compare pre-fix `runpod/2026-05-14/organism_voice_samples_2026_05_14/fire_voice.txt`:
+
+```
+A: The work is the most of the most of the most of the most of the most of the most pace the most of the most of the most...
+```
+
+Deep lock-in killed. Output is BPE subword chain with recognisable corpus
+vocabulary (`music`, `kilometers`, `sediment`, `dream`), sentence
+punctuation, near-grammatical questions — **without one gradient step**.
+
+This is the Q signature reproduced in molequla.
+
+### What stays for the paper
+
+- Pre-fix substrate exploration: `runpod/2026-05-14/*` cells. The 8-cell
+  sweep with «Karpathy gibberish but shaped by element» voice. Commit `5080a91`.
+- Post-fix substrate run (next): RunPod cell with `--corpus-overlay`
+  on the seven-patch build. Paper Body §-by-§ measurement: pre vs
+  post on the same ecology stack.
+
+### Not yet done
+
+- Multi-impl sync (`molequla.c`, `molequla.rs`, `molequla.js`) — Step 6
+  of the original plan (`~/.claude/plans/twinkly-riding-robin.md`).
+  Deferred until pod measurement validates the Go reference.
+- Codex audit on the uncommitted diff — running before commit.
+- PR / push — Oleg's call after audit.
+

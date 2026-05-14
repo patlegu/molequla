@@ -4329,24 +4329,127 @@ func GenerateResonant(model *GPT, tok *EvolvingTokenizer, field *CooccurField, p
 		// prob-blend (which still applies later). When the gate is off,
 		// overlaidLogits is a zero-cost alias of logits.Data.
 		// Q-style metaweights overlay (raw-probability, dynamic-gate auto-curriculum).
-		// Replaces the prior log-prob overlay block which compounded into -200
-		// logit penalties and produced gibberish. MetaweightsOverlay implements
-		// postgpt_q.c:1305-1395 verbatim: magnitude-detect → choose coeffs →
-		// raw probability terms → unigram damping. See metaweights_overlay.go.
-		// Followed by Q's age-graded repetition penalty + bigram blocking
-		// (postgpt_q.c:1399-1408) — breaks «Sppellllllll»-style lock-in that
-		// any overlay alone cannot prevent on tiny untrained models.
+		// MetaweightsOverlay implements postgpt_q.c:1305-1395 + pitomadom.c:583-586
+		// transformer gate: magnitude-detect → silence untrained transformer →
+		// choose coeffs → raw probability terms → unigram damping.
+		// Followed by repetition penalty (postgpt.c:960-967 form: *= 0.5 for
+		// every distinct token in the last 12).
 		overlaidLogits := logits.Data
-		if CFG.CorpusLogitOverlay && field != nil && len(ids) >= 1 {
+		overlayActive := CFG.CorpusLogitOverlay && field != nil && len(ids) >= 1
+		// Detect untrained regime via average |logit|. Mirror postgpt_q.c:1355-1356
+		// (`tmag>0.1 → has_tf`). Below threshold = transformer silent, overlay
+		// drives generation — early tokens must use greedy argmax (postgpt_q.c:1416-1418)
+		// to lock onto a coherent trajectory before any sampling noise enters.
+		untrainedRegime := false
+		if overlayActive {
 			overlaidLogits = make([]float64, len(logits.Data))
 			copy(overlaidLogits, logits.Data)
+			// Measure on raw logits BEFORE overlay applies (overlay also gates
+			// transformer logits to zero when untrained, so this measurement
+			// has to happen on the model output).
+			var tmag float64
+			for _, v := range logits.Data {
+				if v < 0 {
+					tmag -= v
+				} else {
+					tmag += v
+				}
+			}
+			if len(logits.Data) > 0 {
+				tmag /= float64(len(logits.Data))
+			}
+			// Untrained iff smooth transformer gate is below half — tg < 0.5
+			// corresponds to mean|logit| < 1.25 (Q's clamp((mag-0.5)/1.5,0,1)).
+			// Postgpt_q.c uses binary `tmag>0.1` but expects raw (unseeded) wte;
+			// seeded embeddings push mag to ~0.25, so 0.1 too low here. 1.0 keeps
+			// the bootstrap window open until real gradient training lifts mag.
+			untrainedRegime = tmag <= 1.0
 			overlaidLogits, prophecyField = MetaweightsOverlay(overlaidLogits, ids, field, model, prophecyField)
 			MetaweightsRepetitionPenalty(overlaidLogits, ids)
 		}
 
+		// Q-style untrained-regime early-step greedy: postgpt_q.c:1416-1418 —
+		// when there are no transformer weights, the first 10 tokens are taken
+		// as argmax(raw logits). This locks onto the strongest bigram/trigram
+		// successor and stops sampling-noise from poisoning the trajectory
+		// before metaweights have steered it into coherence.
+		//
+		// EOS is excluded from greedy selection during this bootstrap window —
+		// otherwise overlay's bigram/trigram weight on sentence-end tokens
+		// (very common after «.» in corpus) lets every step argmax to EOS,
+		// `continue` skips append, outIDs stays empty, organism is silent.
+		if overlayActive && untrainedRegime && step < 10 {
+			best := -1
+			bestVal := math.Inf(-1)
+			for i, v := range overlaidLogits {
+				if i == eosID {
+					continue
+				}
+				if v > bestVal {
+					bestVal = v
+					best = i
+				}
+			}
+			if best < 0 {
+				best = 0
+			}
+			nxt := best
+			_ = bestVal
+			MetaweightsOverlayCollapse(prophecyField, nxt)
+			ids = append(ids, nxt)
+			cur = nxt
+			outIDs = append(outIDs, nxt)
+			tokenCounts[nxt]++
+			recentBuf = append(recentBuf, nxt)
+			rg := CFG.RepetitionGuard
+			if len(recentBuf) > rg*2 {
+				recentBuf = recentBuf[len(recentBuf)-rg*2:]
+				if sliceEqual(recentBuf[rg:], recentBuf[:rg]) {
+					break
+				}
+			}
+			continue
+		}
+
+		// When the overlay is on, sampling switches to Q-style: hard top-K=15
+		// mask on raw overlay'd logits (everything below the 15th set to -1e10),
+		// then divide by temp, softmax, multinomial — mirror postgpt.c:969-991
+		// and pitomadom.c:761-772. The hard mask kills the long noise-tail that
+		// otherwise competes with overlay peaks under soft top-k/top-p sampling.
 		scaled := make([]float64, len(overlaidLogits))
-		for i, v := range overlaidLogits {
-			scaled[i] = v / temp
+		if overlayActive {
+			topK := 15
+			if topK > len(overlaidLogits) {
+				topK = len(overlaidLogits)
+			}
+			topVals := make([]float64, topK)
+			for i := range topVals {
+				topVals[i] = math.Inf(-1)
+			}
+			for _, v := range overlaidLogits {
+				if v > topVals[topK-1] {
+					topVals[topK-1] = v
+					for k := topK - 2; k >= 0; k-- {
+						if topVals[k+1] > topVals[k] {
+							topVals[k], topVals[k+1] = topVals[k+1], topVals[k]
+						} else {
+							break
+						}
+					}
+				}
+			}
+			threshold := topVals[topK-1]
+			for i, v := range overlaidLogits {
+				if v < threshold {
+					scaled[i] = -1e10
+				} else {
+					scaled[i] = v / temp
+				}
+			}
+		} else {
+			for i, v := range overlaidLogits {
+				scaled[i] = v / temp
+			}
 		}
 		modelProbs := SoftmaxProbs(scaled)
 
@@ -4384,10 +4487,15 @@ func GenerateResonant(model *GPT, tok *EvolvingTokenizer, field *CooccurField, p
 		}
 		if dissonanceMul != 1.0 {
 			temp *= dissonanceMul
-			// Use overlaidLogits so the B2 corpus-logit overlay (if enabled)
-			// survives a dissonance-driven re-scale. When the overlay gate is
-			// off, overlaidLogits == logits.Data — no behaviour change.
+			// Preserve the hard top-K mask when overlay is on: positions masked
+			// to -1e10 above must stay masked, otherwise dissonance rescale
+			// reintroduces the long noise tail the patch eliminates. Threshold
+			// at -1e9 safely distinguishes masked sentinels from any plausible
+			// post-overlay raw logit value.
 			for i, v := range overlaidLogits {
+				if overlayActive && scaled[i] < -1e9 {
+					continue
+				}
 				scaled[i] = v / temp
 			}
 			modelProbs = SoftmaxProbs(scaled)
@@ -5575,6 +5683,11 @@ func parseCLIArgs() (organismID string, configPath string, element string, evolu
 			CFG.SPACoherenceGate = true
 		} else if os.Args[i] == "--corpus-overlay" {
 			CFG.CorpusLogitOverlay = true
+		} else if os.Args[i] == "--zero-warmup" {
+			// Skip all per-stage warmup training. Used to test pure
+			// Q-style zero-training coherence: embryo organism receives only
+			// metaweight-seeded embeddings + overlay, no gradient steps.
+			CFG.WarmupSteps = 0
 		}
 	}
 	return
@@ -6064,8 +6177,17 @@ func main() {
 
 	docs := loadCorpusLines(CFG.CorpusPath)
 
-	// Restore model dimensions from checkpoint config (ontogenesis may have changed them)
-	model, tok, err := LoadCheckpoint(docs, "")
+	// Restore model dimensions from checkpoint config (ontogenesis may have changed them).
+	// Zero-warmup test mode (--zero-warmup, CFG.WarmupSteps==0) skips checkpoint load
+	// so the test always exercises a fresh embryo; otherwise the test silently uses a
+	// stale trained checkpoint and the Q-style coherence claim becomes meaningless.
+	var model *GPT
+	var tok *EvolvingTokenizer
+	if CFG.WarmupSteps > 0 {
+		model, tok, err = LoadCheckpoint(docs, "")
+	} else {
+		err = fmt.Errorf("zero-warmup mode: skipping checkpoint load")
+	}
 	if err != nil || model == nil || tok == nil {
 		if len(docs) == 0 {
 			docs = []string{"Hello."}
@@ -6093,13 +6215,13 @@ func main() {
 		model.corpusField = tmpCooccur
 
 		// Seed embeddings from metaweights (postgpt's «tokenizer IS training»
-		// trick, ~postgpt.c:545-570). Biases wte by Hebbian co-occurrence and
+		// trick, postgpt.c:541-574). Biases wte by Hebbian co-occurrence and
 		// lm_head by unigram × wte BEFORE any warmup training. Gives the
 		// untrained organism corpus-shaped embeddings → coherent first words.
-		// scale=0.1 mirrors postgpt's default. Gated on CFG.CorpusLogitOverlay
+		// scale=0.15 verbatim from postgpt.c:542. Gated on CFG.CorpusLogitOverlay
 		// so default-off path stays identical to main branch behaviour.
 		if CFG.CorpusLogitOverlay {
-			SeedEmbeddingsFromMetaweights(model, tmpCooccur, 0.1)
+			SeedEmbeddingsFromMetaweights(model, tmpCooccur, 0.15)
 		}
 
 		// Detect if stdin is a terminal (interactive mode)
@@ -6124,22 +6246,28 @@ func main() {
 				warmupScale = 1
 			}
 			effectiveWarmup := CFG.WarmupSteps * warmupScale
-			backpropSteps := effectiveWarmup  // 100% backprop, notorch warmup disabled (was 0.6)
-			notorchDeltaSteps := 0  // disabled: notorch warmup diverges at stage 5
-			fmt.Printf("[init] Stage %d (%s): embd=%d, layer=%d, head=%d — warmup %d steps (%d backprop + %d notorch, sqrt-scaled %dx)\n",
-				stage, stageName, model.NEmbd, model.NLayer, model.NHead, effectiveWarmup, backpropSteps, notorchDeltaSteps, warmupScale)
-			// Phase A: backprop with progressive sequence length (short→full)
-			earlySteps := int(float64(backpropSteps) * 0.4)
-			midSteps := int(float64(backpropSteps) * 0.3)
-			lateSteps := backpropSteps - earlySteps - midSteps
-			amlTrainSteps(model, tok, docs, earlySteps, 8)   // very short seqs, batch=1
-			amlTrainSteps(model, tok, docs, midSteps, 16)    // short seqs, batch=1
-			amlTrainSteps(model, tok, docs, lateSteps, 32)   // medium seqs, batch=1
-			// Phase B: notorch for delta adapters (40%, no autograd = much faster)
-			// notorchTrainSteps DISABLED in warmup — diverges at stage 5 (loss 3.5→116)
-			// notorchTrainSteps(model, tok, docs, notorchDeltaSteps, CFG.NotorchLR)
-			model.lastWarmupStage = stage
-			SaveCheckpoint(model, tok, "")
+			if effectiveWarmup > 0 {
+				backpropSteps := effectiveWarmup  // 100% backprop, notorch warmup disabled (was 0.6)
+				notorchDeltaSteps := 0  // disabled: notorch warmup diverges at stage 5
+				fmt.Printf("[init] Stage %d (%s): embd=%d, layer=%d, head=%d — warmup %d steps (%d backprop + %d notorch, sqrt-scaled %dx)\n",
+					stage, stageName, model.NEmbd, model.NLayer, model.NHead, effectiveWarmup, backpropSteps, notorchDeltaSteps, warmupScale)
+				// Phase A: backprop with progressive sequence length (short→full)
+				earlySteps := int(float64(backpropSteps) * 0.4)
+				midSteps := int(float64(backpropSteps) * 0.3)
+				lateSteps := backpropSteps - earlySteps - midSteps
+				amlTrainSteps(model, tok, docs, earlySteps, 8)   // very short seqs, batch=1
+				amlTrainSteps(model, tok, docs, midSteps, 16)    // short seqs, batch=1
+				amlTrainSteps(model, tok, docs, lateSteps, 32)   // medium seqs, batch=1
+				model.lastWarmupStage = stage
+				SaveCheckpoint(model, tok, "")
+			} else {
+				fmt.Printf("[init] Stage %d (%s): embd=%d, layer=%d, head=%d — zero-warmup mode, skipping all gradient steps\n",
+					stage, stageName, model.NEmbd, model.NLayer, model.NHead)
+				// Do NOT update lastWarmupStage or call SaveCheckpoint here:
+				// pollluting the checkpoint with a zero-step «warmed» marker
+				// would make every future normal launch from this dir skip its
+				// embryo warmup. The test must leave on-disk state untouched.
+			}
 
 			// Demo: show what the organism can say at this stage
 			// Use model+corpus blend (same as normal REPL) so corpus field helps early stages speak
@@ -6153,6 +6281,11 @@ func main() {
 			}
 			fmt.Println()
 
+			// Zero-warmup test mode: stop after embryo voice — no ontogenesis,
+			// no further training. Pure Q-style untrained-coherence check.
+			if CFG.WarmupSteps == 0 {
+				break
+			}
 			// Try to grow to next stage (gated by corpus size)
 			if !model.MaybeGrowArchitecture(corpusChars) {
 				break // corpus too small for next stage, or already at max
@@ -6185,6 +6318,13 @@ func main() {
 			}
 		}
 		fmt.Printf("[init] Warmup complete at stage %d. Organism ready.\n", model.CurrentGrowthStage())
+
+		// Zero-warmup test exits here — do not enter ecology / REPL / shutdown
+		// SaveCheckpoint paths that would persist a zero-step «trained» marker.
+		if CFG.WarmupSteps == 0 {
+			fmt.Println("[init] Zero-warmup test complete — exit before REPL/ecology to preserve on-disk state.")
+			return
+		}
 	}
 
 	// Enable BPE in main before REPL starts (avoid race with background trainer)
