@@ -968,3 +968,78 @@ actually fire.
   pending re-run completion.
 - Available strikes remaining: 2 (per three-strikes rule in
   `memory/protocol_singularity_mode_2026_05_08.md`).
+
+---
+
+## 2026-05-14 — Post-BLAS 30-min finding — character shift, not rate shift
+
+By 30-min mark on the BLAS-linked run, all 4 organisms **still at
+stage 2 (child)**. No mitosis. Singularity strike 1 did NOT unstuck
+ontogenesis stage transitions in this window.
+
+But the ecology character changed dramatically. Comparison
+30-min mark, same flags, same DUR, only difference is BLAS link:
+
+| Metric | pre-BLAS (cell_extended_NOBLAS_60min) | post-BLAS |
+|---|---|---|
+| DNA writes / org (avg) | ~200 | ~22 |
+| DNA bytes / write (avg) | ~25 | ~267 |
+| DNA total bytes / org | ~5000 | ~3500 |
+| Last stage | child | child |
+| AML bursts per org | many (every few sec) | 2-3 in 30 min |
+| Delta modules per org | typically 1 | earth=2, fire=3 |
+
+**The shift:** BLAS-on organism emits **fewer, longer, more
+substantive fragments** instead of many short ones. Training bursts
+are **less frequent but deeper** (when the trainer fires, it has
+more accumulated novelty to chew on). **Internal delta modules grow
+sooner** (`[trainer] growing new delta module (total: 2) — new
+soul appended.`).
+
+Honest interpretation: BLAS didn't make the same organism faster.
+It changed which actions the syntropy controller picks. Faster
+matvec → fewer cycles spent waiting for the kernel to finish →
+different thresholds trip differently → different action profile
+across the ecology.
+
+**For Body — this is richer than «BLAS = faster organisms»:**
+> «I changed one CGO directive. The matmul kernel changed. The
+> ecology became a different ecology — same code, same flags,
+> same prompts, same seeds, same physics, same ontology. The
+> organism with BLAS engaged was not the same organism running
+> with one extra knob. It was a structurally different ecology
+> because the rate at which experience accumulated had a different
+> texture.»
+
+Pre-BLAS run preserved as
+`runpod/2026-05-14/cell_extended_NOBLAS_60min/`. Post-BLAS run
+continues until 06:55:50 UTC, captured at 30-min snapshot above and
+60-min snapshot pending.
+
+---
+
+## 2026-05-14 — GPU on pod is idle (CPU-only molequla)
+
+`nvidia-smi --query-gpu=...` on the A100 SXM pod 05:55 UTC:
+
+```
+NVIDIA A100-SXM4-80GB, 0 %, 0 MiB, 81920 MiB
+```
+
+GPU utilization 0%, memory used 0 MiB out of 81920 MiB. The A100 is
+sitting fully idle. Pod billing ($1.49/hr) is paying for the host
+CPU + RAM allocation, **not for GPU work**. molequla has no CUDA
+path in this build — we deliberately did not pull `notorch_cuda.cu`
+into vendored during Phase A (scope decision documented at top of
+this log). To engage GPU would need: vendored notorch CUDA blocks,
+AML CUDA blocks, GPU memory management in molequla.go, Net2Net
+tensor resize on GPU, mitosis-side per-child CUDA context
+coordination. Multi-week feature, out of paper-cycle scope.
+
+The A100 pod was chosen for its **16 vCPU / 250 GB RAM allocation
+side effect**, not for compute on the GPU itself. A pure CPU pod
+would have served identically — and for ~$0.07/hr instead of
+$1.49/hr. Logged as a cost-shape observation for the next
+RunPod cycle: when molequla actually gains a CUDA path, this
+overhead becomes work; until then, large CPU pods (~$0.30/hr) are
+the right choice.
