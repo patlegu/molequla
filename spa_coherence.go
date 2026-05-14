@@ -133,3 +133,32 @@ func SPAWeakSentences(scores []float32) []int {
 	}
 	return weak
 }
+
+// SPAWeakestIndex returns the index of the sentence with the LOWEST score,
+// or -1 if input is empty. Used as Q's «find weakest» (postgpt_q.c:1691).
+func SPAWeakestIndex(scores []float32) int {
+	if len(scores) == 0 {
+		return -1
+	}
+	idx := 0
+	min := scores[0]
+	for i := 1; i < len(scores); i++ {
+		if scores[i] < min {
+			min = scores[i]
+			idx = i
+		}
+	}
+	return idx
+}
+
+// firstSentence extracts the substring up to the first .!? boundary
+// (inclusive). Used by SPA reseed to clip regenerated text to a single
+// sentence replacement. If no boundary found, returns the whole string.
+func firstSentence(s string) string {
+	for i, r := range s {
+		if r == '.' || r == '!' || r == '?' {
+			return s[:i+1]
+		}
+	}
+	return s
+}

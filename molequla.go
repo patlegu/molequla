@@ -4278,19 +4278,10 @@ func GenerateResonant(model *GPT, tok *EvolvingTokenizer, field *CooccurField, p
 	entropyCount := 0
 	tokenCounts := make(map[int]int) // frequency penalty
 
-	// B2 Destiny precompute: project wte rows onto purpose direction once.
-	// Purpose vector is constant during generation (deltas frozen, gradEnabled=false),
-	// so per-step recomputation is wasted work. Lazily computed inside overlay
-	// block on first use; nil when overlay is off, no deltas, or wte missing.
-	var destinyBias []float64
-	destinyBiasComputed := false
-
-	// B2 Prophecy field — persistent token expectations across generation steps.
-	// Seeded from current ctx ngrams (trigram if 2+ tokens, bigram fallback);
-	// ages each step (× MetaProphecyDecay), bias-adds c_pro·log(prophecy_prob)
-	// to logits, collapses chosen token to zero after sample. Mirrors Dario's
-	// F term and Q's «expectations age + decay + collapse» pattern
-	// (q/README.md:55-66). nil when overlay off, c_pro=0, or no ctx.
+	// Q-style metaweights overlay state — persistent prophecy field across
+	// the generation loop. MetaweightsOverlay (see metaweights_overlay.go) owns
+	// the lifecycle: nil → seeded on first call → aged each step → collapsed on
+	// chosen token via MetaweightsOverlayCollapse after sample.
 	var prophecyField []float64
 
 	for step := 0; step < CFG.MaxGenTokens; step++ {
@@ -4337,169 +4328,20 @@ func GenerateResonant(model *GPT, tok *EvolvingTokenizer, field *CooccurField, p
 		// see PROJECT_LOG.md B2.F deferred note). Coexists with the post-softmax
 		// prob-blend (which still applies later). When the gate is off,
 		// overlaidLogits is a zero-cost alias of logits.Data.
+		// Q-style metaweights overlay (raw-probability, dynamic-gate auto-curriculum).
+		// Replaces the prior log-prob overlay block which compounded into -200
+		// logit penalties and produced gibberish. MetaweightsOverlay implements
+		// postgpt_q.c:1305-1395 verbatim: magnitude-detect → choose coeffs →
+		// raw probability terms → unigram damping. See metaweights_overlay.go.
+		// Followed by Q's age-graded repetition penalty + bigram blocking
+		// (postgpt_q.c:1399-1408) — breaks «Sppellllllll»-style lock-in that
+		// any overlay alone cannot prevent on tiny untrained models.
 		overlaidLogits := logits.Data
 		if CFG.CorpusLogitOverlay && field != nil && len(ids) >= 1 {
 			overlaidLogits = make([]float64, len(logits.Data))
 			copy(overlaidLogits, logits.Data)
-			V := len(overlaidLogits)
-			trigramCounts := make([]float64, V)
-			bigramCounts := make([]float64, V)
-			cooccurCounts := make(map[int]float64)
-			var trigramTotal, bigramTotal, cooccurTotal float64
-			field.mu.RLock()
-			if len(ids) >= 2 {
-				a, b := ids[len(ids)-2], ids[len(ids)-1]
-				if ctx, ok := field.TrigramByContext[[2]int{a, b}]; ok {
-					for tid, v := range ctx {
-						if tid < V {
-							trigramCounts[tid] = v
-							trigramTotal += v
-						}
-					}
-				}
-			}
-			prev := ids[len(ids)-1]
-			if ctx, ok := field.BigramByFirst[prev]; ok {
-				for tid, v := range ctx {
-					if tid < V {
-						bigramCounts[tid] = v
-						bigramTotal += v
-					}
-				}
-			}
-			// Hebbian H — aggregate window-weighted co-occurrence over recent ctx.
-			windowSize := CFG.CooccurWindowSize
-			if windowSize <= 0 || windowSize > len(ids) {
-				windowSize = len(ids)
-			}
-			for j := len(ids) - windowSize; j < len(ids); j++ {
-				if neighbors, ok := field.CooccurWindow[ids[j]]; ok {
-					for tid, cnt := range neighbors {
-						cooccurCounts[tid] += cnt
-					}
-				}
-			}
-			for _, cnt := range cooccurCounts {
-				cooccurTotal += cnt
-			}
-			field.mu.RUnlock()
-			floor := CFG.MetaLogitOverlayFloor
-			if floor <= 0 {
-				floor = 1e-6
-			}
-			logFloor := math.Log(floor)
-			for i := 0; i < V; i++ {
-				bgLogProb := logFloor
-				tgLogProb := logFloor
-				if bigramTotal > 0 && bigramCounts[i] > 0 {
-					bgLogProb = math.Log(bigramCounts[i] / bigramTotal)
-				}
-				if trigramTotal > 0 && trigramCounts[i] > 0 {
-					tgLogProb = math.Log(trigramCounts[i] / trigramTotal)
-				}
-				overlaidLogits[i] += CFG.MetaCBigram*bgLogProb + CFG.MetaCTrigram*tgLogProb
-			}
-			if cooccurTotal > 0 && CFG.MetaCHebbian != 0 {
-				for tid, cnt := range cooccurCounts {
-					if tid < V {
-						hebLogProb := math.Log(cnt / cooccurTotal)
-						overlaidLogits[tid] += CFG.MetaCHebbian * hebLogProb
-					}
-				}
-			}
-			// Destiny A — embedding-space drift direction projected onto wte.
-			// Use GammaContrastiveProjection (embedding-dim direction, length =
-			// wte.Nin) rather than ComputePurposeVector (rank-dim direction,
-			// length = adapter rank). Previous use of PurposeVector left
-			// destinyBias nil whenever embed_dim > rank (i.e. always under
-			// default model settings). Fix per Codex audit 2026-05-14 P2.
-			// Computed once lazily (constant through generation).
-			if !destinyBiasComputed {
-				destinyBiasComputed = true
-				if CFG.MetaCDestiny != 0 && model != nil {
-					if gammaDir, mag := model.GammaContrastiveProjection(); mag > 0 && len(gammaDir) > 0 {
-						if wte := model.Base["wte"]; wte != nil {
-							D := wte.Nin
-							if D > 0 && D <= len(gammaDir) {
-								destinyBias = make([]float64, V)
-								for v := 0; v < V && v < wte.Nout; v++ {
-									row := wte.Rows[v].Data
-									var dot float64
-									for d := 0; d < D; d++ {
-										dot += row[d] * gammaDir[d]
-									}
-									destinyBias[v] = dot
-								}
-							}
-						}
-					}
-				}
-			}
-			if destinyBias != nil {
-				for i := 0; i < V && i < len(destinyBias); i++ {
-					overlaidLogits[i] += CFG.MetaCDestiny * destinyBias[i]
-				}
-			}
-			// Prophecy F — persistent expectation field, age + bias + (collapse below).
-			if CFG.MetaCProphecy != 0 {
-				if prophecyField == nil {
-					// Seed from trigram-by-ctx (primary) + bigram-by-prev (×0.5 fallback).
-					prophecyField = make([]float64, V)
-					field.mu.RLock()
-					if len(ids) >= 2 {
-						a, b := ids[len(ids)-2], ids[len(ids)-1]
-						if ctx, ok := field.TrigramByContext[[2]int{a, b}]; ok {
-							for tid, cnt := range ctx {
-								if tid < V {
-									prophecyField[tid] += cnt
-								}
-							}
-						}
-					}
-					if ctx, ok := field.BigramByFirst[ids[len(ids)-1]]; ok {
-						for tid, cnt := range ctx {
-							if tid < V {
-								prophecyField[tid] += 0.5 * cnt
-							}
-						}
-					}
-					field.mu.RUnlock()
-					var seedTotal float64
-					for _, w := range prophecyField {
-						seedTotal += w
-					}
-					if seedTotal > 0 {
-						for i := range prophecyField {
-							prophecyField[i] /= seedTotal
-						}
-					} else {
-						prophecyField = nil
-					}
-				} else {
-					// Age existing prophecies.
-					decay := CFG.MetaProphecyDecay
-					if decay <= 0 || decay > 1 {
-						decay = 0.95
-					}
-					for i := range prophecyField {
-						prophecyField[i] *= decay
-					}
-				}
-				if prophecyField != nil {
-					var total float64
-					for _, w := range prophecyField {
-						total += w
-					}
-					if total > 0 {
-						for i := 0; i < V; i++ {
-							if prophecyField[i] > 0 {
-								proLogProb := math.Log(prophecyField[i] / total)
-								overlaidLogits[i] += CFG.MetaCProphecy * proLogProb
-							}
-						}
-					}
-				}
-			}
+			overlaidLogits, prophecyField = MetaweightsOverlay(overlaidLogits, ids, field, model, prophecyField)
+			MetaweightsRepetitionPenalty(overlaidLogits, ids)
 		}
 
 		scaled := make([]float64, len(overlaidLogits))
@@ -4555,8 +4397,11 @@ func GenerateResonant(model *GPT, tok *EvolvingTokenizer, field *CooccurField, p
 		tokenAlpha := 1.0 / (1.0 + math.Exp(-CFG.CorpusFadeK*(CFG.CorpusFadeThreshold-entropy)))
 
 		// Corpus blend: skip entirely when tokenAlpha >= 0.99 (pure model mode)
+		// or when CFG.CorpusLogitOverlay is on — the Q-style pre-softmax overlay
+		// already applied raw-prob corpus signal; double-blending in prob space
+		// distorts the distribution. Postgpt / Q use one overlay path only.
 		var blended []float64
-		if tokenAlpha >= 0.99 || field == nil {
+		if tokenAlpha >= 0.99 || field == nil || CFG.CorpusLogitOverlay {
 			blended = modelProbs
 		} else {
 			corpusCounts := make([]float64, tok.VocabSize)
@@ -4617,11 +4462,10 @@ func GenerateResonant(model *GPT, tok *EvolvingTokenizer, field *CooccurField, p
 
 		nxt := TopKTopPSample(blended, CFG.TopK, CFG.TopP, CFG.MinP, CFG.TypicalP)
 
-		// B2 Prophecy collapse: chosen token fulfilled an expectation, zero its
+		// Prophecy collapse — chosen token fulfilled an expectation, zero its
 		// prophecy slot so the field shifts toward what's still unsaid.
-		if prophecyField != nil && nxt >= 0 && nxt < len(prophecyField) {
-			prophecyField[nxt] = 0
-		}
+		// Delegates to MetaweightsOverlayCollapse for nil-safety.
+		MetaweightsOverlayCollapse(prophecyField, nxt)
 
 		if nxt == eosID && step >= CFG.MinGenTokens {
 			break
@@ -4667,15 +4511,13 @@ func GenerateResonant(model *GPT, tok *EvolvingTokenizer, field *CooccurField, p
 	decIDs = append(decIDs, eosID)
 	response := tok.Decode(decIDs)
 
-	// SPA coherence gate (B1 step 3 — Phase B coherence layer).
-	// Forward-only Sentence Phonon Attention score per sentence; logs
-	// connectedness + weak indices to stderr when CFG.SPACoherenceGate is
-	// enabled. Does NOT reseed weak sentences yet — reseed is Phase C
-	// activation (requires GenerateResonant restructuring to regenerate
-	// individual sentences with neighbor context). With the gate enabled
-	// here, no output text changes; only an observable signal lands in
-	// logs so a RunPod measurement run can compare gate-on vs gate-off
-	// stats on the same prompts / seeds / weights.
+	// SPA — Sentence Phonon Attention reseed pass.
+	// Mirror of postgpt_q.c:1684-1717. Splits response into sentences, scores
+	// cross-sentence connectedness, finds the weakest, regenerates it from the
+	// last 3 tokens of a neighbouring sentence, splices it back in. Single
+	// pass — Q does 2 but we keep budget tight at the first call. Recursive
+	// call into GenerateResonant disabled via SPACoherenceGate flip to avoid
+	// infinite recursion; restored after.
 	if CFG.SPACoherenceGate {
 		var sentences []string
 		buf := ""
@@ -4704,17 +4546,11 @@ func GenerateResonant(model *GPT, tok *EvolvingTokenizer, field *CooccurField, p
 						W[base+d] = float32(row[d])
 					}
 				}
-				// Strip BOS/EOS sentinels per sentence — `tok.Encode` wraps
-				// every sentence with both, and spa_embed weights the last
-				// token most (alpha^(n-1-i)), so the shared EOS would dominate
-				// every sentence's embedding and make unrelated sentences look
-				// connected. Fix per Codex audit 2026-05-14 P2.
 				bosID := tok.Stoi[tok.BOS]
 				eosID := tok.Stoi[tok.EOS]
 				sentTokens := make([][]int, len(sentences))
 				for i, s := range sentences {
 					enc := tok.Encode(s)
-					// Strip leading BOS / trailing EOS if present.
 					for len(enc) > 0 && enc[0] == bosID {
 						enc = enc[1:]
 					}
@@ -4724,10 +4560,45 @@ func GenerateResonant(model *GPT, tok *EvolvingTokenizer, field *CooccurField, p
 					sentTokens[i] = enc
 				}
 				scores := SPACoherenceScores(W, sentTokens, D, CFG.SPAEmbedAlpha)
-				weak := SPAWeakSentences(scores)
-				fmt.Fprintf(os.Stderr,
-					"[spa-gate] S=%d D=%d alpha=%g scores=%v weak=%v\n",
-					len(sentences), D, CFG.SPAEmbedAlpha, scores, weak)
+				weakIdx := SPAWeakestIndex(scores)
+				if weakIdx >= 0 {
+					var sum float32
+					for _, s := range scores {
+						sum += s
+					}
+					avg := sum / float32(len(scores))
+					threshold := SPAWeakThresholdRatio * avg
+					fmt.Fprintf(os.Stderr,
+						"[spa] S=%d weakest=%d score=%.3f avg=%.3f thr=%.3f\n",
+						len(sentences), weakIdx, scores[weakIdx], avg, threshold)
+					if scores[weakIdx] < threshold {
+						srcIdx := weakIdx - 1
+						if srcIdx < 0 || srcIdx >= len(sentTokens) {
+							srcIdx = weakIdx + 1
+						}
+						if srcIdx >= 0 && srcIdx < len(sentTokens) && len(sentTokens[srcIdx]) > 0 {
+							seedLen := 3
+							if seedLen > len(sentTokens[srcIdx]) {
+								seedLen = len(sentTokens[srcIdx])
+							}
+							seedTokens := sentTokens[srcIdx][len(sentTokens[srcIdx])-seedLen:]
+							seedPrompt := tok.Decode(append(append([]int{bosID}, seedTokens...), eosID))
+							// Recursive call — disable SPA inside.
+							savedSPA := CFG.SPACoherenceGate
+							CFG.SPACoherenceGate = false
+							regenerated := GenerateResonant(model, tok, field, seedPrompt, docs, true)
+							CFG.SPACoherenceGate = savedSPA
+							regenerated = strings.TrimSpace(regenerated)
+							newSentence := strings.TrimSpace(firstSentence(regenerated))
+							if len(newSentence) >= 4 && newSentence != sentences[weakIdx] {
+								response = strings.Replace(response, sentences[weakIdx], newSentence, 1)
+								fmt.Fprintf(os.Stderr,
+									"[spa] reseeded weak %d: %q -> %q\n",
+									weakIdx, sentences[weakIdx], newSentence)
+							}
+						}
+					}
+				}
 			}
 		}
 	}
@@ -6220,6 +6091,16 @@ func main() {
 		tmpCooccur := NewCooccurField()
 		tmpCooccur.BuildFromCorpus(tok, docs)
 		model.corpusField = tmpCooccur
+
+		// Seed embeddings from metaweights (postgpt's «tokenizer IS training»
+		// trick, ~postgpt.c:545-570). Biases wte by Hebbian co-occurrence and
+		// lm_head by unigram × wte BEFORE any warmup training. Gives the
+		// untrained organism corpus-shaped embeddings → coherent first words.
+		// scale=0.1 mirrors postgpt's default. Gated on CFG.CorpusLogitOverlay
+		// so default-off path stays identical to main branch behaviour.
+		if CFG.CorpusLogitOverlay {
+			SeedEmbeddingsFromMetaweights(model, tmpCooccur, 0.1)
+		}
 
 		// Detect if stdin is a terminal (interactive mode)
 		isInteractive := false
