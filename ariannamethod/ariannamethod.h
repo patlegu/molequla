@@ -607,6 +607,28 @@ void am_tape_adam_step(float lr);
 AM_Tape* am_tape_get(void);
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// NaN/Inf GUARD — detect divergence in param grads, dynamic loss scaling.
+// Mirrored from canonical AML faa4d9b 2026-04-16. API-only pull at this stage;
+// not wired into molequla's aml_trainer.go generated script until verified
+// needed on a RunPod measurement (Phase C).
+// ═══════════════════════════════════════════════════════════════════════════════
+
+typedef struct {
+    float loss_scale;         // dynamic loss scale (starts at 1.0)
+    float scale_factor;       // multiply/divide by this (default 2.0)
+    int   stable_steps;       // consecutive clean steps
+    int   scale_window;       // increase scale after this many clean steps
+    int   total_nan_count;    // lifetime NaN detections
+    int   skipped_steps;      // steps skipped due to NaN
+} AM_NanGuard;
+
+AM_NanGuard am_nan_guard_new(void);
+// Returns 1 if clean, 0 if NaN/Inf detected. On NaN: zeros all param grads,
+// halves loss_scale (floor 1.0). On clean: increments stable_steps, doubles
+// loss_scale every scale_window clean steps.
+int am_nan_guard_check(AM_NanGuard* guard);
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // ASYNC (v4.0 Phase 4) — SPAWN/AWAIT/CHANNEL
 // pthreads-based parallel execution. Each SPAWN gets its own AML_ExecCtx
 // with a snapshot of globals. Channels provide thread-safe communication.

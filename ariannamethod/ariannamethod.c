@@ -1700,6 +1700,63 @@ static int tape_ensure_entry(AM_Array* arr) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// NaN/Inf GUARD — scan all param grads, zero them if any NaN/Inf detected,
+// adjust dynamic loss_scale. Mirrored from canonical AML faa4d9b 2026-04-16.
+// API-only at this stage — not auto-wired into AML interpreter or molequla
+// aml_trainer.go script generation. Activate by calling am_nan_guard_check()
+// directly from a C consumer (CGO bridge), or by adding TAPE NAN_CHECK
+// interpreter case in a follow-up.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+AM_NanGuard am_nan_guard_new(void) {
+    AM_NanGuard g = {0};
+    g.loss_scale = 1.0f;
+    g.scale_factor = 2.0f;
+    g.scale_window = 100;
+    return g;
+}
+
+int am_nan_guard_check(AM_NanGuard* guard) {
+    if (!guard) return 1;
+    int has_nan = 0;
+
+    for (int i = 0; i < g_tape.count && !has_nan; i++) {
+        AM_TapeEntry* e = &g_tape.entries[i];
+        if (!e->is_param || !e->grad) continue;
+        int n = e->grad->len;
+        for (int j = 0; j < n; j++) {
+            float gv = e->grad->data[j];
+            // NaN: gv != gv. Inf: +/- infinity.
+            if (gv != gv || gv == 1.0f/0.0f || gv == -1.0f/0.0f) {
+                has_nan = 1;
+                break;
+            }
+        }
+    }
+
+    if (has_nan) {
+        for (int i = 0; i < g_tape.count; i++) {
+            AM_TapeEntry* e = &g_tape.entries[i];
+            if (!e->is_param || !e->grad) continue;
+            memset(e->grad->data, 0, (size_t)e->grad->len * sizeof(float));
+        }
+        guard->loss_scale /= guard->scale_factor;
+        if (guard->loss_scale < 1.0f) guard->loss_scale = 1.0f;
+        guard->total_nan_count++;
+        guard->skipped_steps++;
+        guard->stable_steps = 0;
+        return 0;
+    }
+
+    guard->stable_steps++;
+    if (guard->scale_window > 0 && guard->stable_steps >= guard->scale_window) {
+        guard->loss_scale *= guard->scale_factor;
+        guard->stable_steps = 0;
+    }
+    return 1;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // ASYNC — SPAWN/AWAIT/CHANNEL (v4.0 Phase 4)
 // ═══════════════════════════════════════════════════════════════════════════════
 

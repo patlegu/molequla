@@ -71,6 +71,13 @@ int nt_tensor_reshape(nt_tensor* t, const int* new_shape, int new_ndim);
 // Print tensor info (shape, first/last few values)
 void nt_tensor_print(const nt_tensor* t, const char* name);
 
+// Public sync wrapper: ensures CPU mirror reflects authoritative state.
+// On CPU-only build (no USE_CUDA) this is a no-op since CPU is always
+// the source of truth. Added to mirror canonical notorch interface so
+// backward CPU branches that read parent->output->data stay safe when
+// a future CUDA build path is enabled.
+void nt_tensor_sync_cpu(nt_tensor* t);
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // AUTOGRAD TAPE — reverse-mode automatic differentiation
 // ═══════════════════════════════════════════════════════════════════════════════

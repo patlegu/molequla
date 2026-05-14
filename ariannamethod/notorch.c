@@ -21,6 +21,22 @@
   #endif
 #endif
 
+#ifdef USE_SIMD
+  #ifdef USE_BLAS
+    #error "USE_SIMD and USE_BLAS are mutually exclusive — pick one matmul backend."
+  #endif
+  // In-house AVX2 + FMA shim for cblas_sgemm / sgemv / sger.
+  // Lets every existing cblas_* call site stay unchanged.
+  #ifdef NOTORCH_SIMD_DEBUG_SCALAR
+    #include "notorch_simd_scalar.h"
+  #else
+    #include "notorch_simd.h"
+  #endif
+  // Also satisfy the original `#ifdef USE_BLAS` guards in this file by aliasing
+  // them on. The shim defines the same CBLAS_* enums and functions.
+  #define USE_BLAS 1
+#endif
+
 #ifdef USE_CUDA
   #include "notorch_cuda.h"
 #endif
@@ -172,6 +188,18 @@ void nt_tensor_print(const nt_tensor* t, const char* name) {
         if (t->len > 1) printf(" last=%.4f", t->data[t->len - 1]);
     }
     printf("\n");
+}
+
+/* Public sync wrapper: mirrors canonical notorch interface. On non-USE_CUDA
+ * build this is a no-op since CPU is always authoritative; on a future
+ * USE_CUDA path it would call nt_tensor_ensure_cpu(t) to D2H copy when GPU
+ * is the truth. Pulled with the MUL/SILU backward fix (canonical 8ab5062). */
+void nt_tensor_sync_cpu(nt_tensor* t) {
+#ifdef USE_CUDA
+    nt_tensor_ensure_cpu(t);
+#else
+    (void)t;
+#endif
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -384,6 +412,13 @@ void nt_tape_backward(int loss_idx) {
             if (e->parent1 >= 0 && e->parent2 >= 0) {
                 nt_tape_entry* pa = &g_tape.entries[e->parent1];
                 nt_tape_entry* pb = &g_tape.entries[e->parent2];
+                /* SwiGLU / gate-blend FIX 2026-05-11 (canonical 8ab5062):
+                 * forward output of both parents may live on GPU; CPU mirror
+                 * is stale calloc-zero. Without sync, ga=gb=0 — masks all
+                 * LoRA gradients on the mlp_gate + mlp_up SwiGLU branch.
+                 * No-op on CPU-only build. */
+                nt_tensor_sync_cpu(pa->output);
+                nt_tensor_sync_cpu(pb->output);
                 float* ga = (float*)calloc(out_len, sizeof(float));
                 float* gb = (float*)calloc(out_len, sizeof(float));
                 if (ga && gb) {
@@ -442,6 +477,11 @@ void nt_tape_backward(int loss_idx) {
         case NT_OP_SILU: {
             if (e->parent1 >= 0) {
                 nt_tape_entry* px = &g_tape.entries[e->parent1];
+                /* FIX 2026-05-11 (canonical 8ab5062): parent output may be
+                 * GPU-resident; CPU stale gives sigmoid(0)=0.5 partial grad
+                 * — still corrupts the SiLU derivative used in SwiGLU
+                 * mlp_gate path. No-op on CPU-only build. */
+                nt_tensor_sync_cpu(px->output);
                 float* gx = (float*)calloc(out_len, sizeof(float));
                 if (gx) {
                     for (int i = 0; i < out_len; i++) {
@@ -477,6 +517,12 @@ void nt_tape_backward(int loss_idx) {
             // parent1 = x, parent2 = gamma (-1 if none)
             if (e->parent1 >= 0) {
                 nt_tape_entry* px = &g_tape.entries[e->parent1];
+                /* CPU-sync audit 2026-05-14 (canonical 8ab5062 bug-class):
+                 * px->output and pg->output may be GPU-resident; CPU mirror
+                 * stale gives zero/garbage gradients. No-op on CPU-only. */
+                nt_tensor_sync_cpu(px->output);
+                if (e->parent2 >= 0 && e->parent2 < g_tape.count)
+                    nt_tensor_sync_cpu(g_tape.entries[e->parent2].output);
                 int n = out_len;
                 float ss = 0;
                 for (int i = 0; i < n; i++) ss += px->output->data[i] * px->output->data[i];
@@ -659,11 +705,17 @@ void nt_tape_backward(int loss_idx) {
             // parent1 = x, parent2 = gamma (-1 if none)
             if (e->parent1 >= 0) {
                 nt_tape_entry* px = &g_tape.entries[e->parent1];
+                /* CPU-sync audit 2026-05-14 (canonical 8ab5062 bug-class).
+                 * No-op on CPU-only. */
+                nt_tensor_sync_cpu(px->output);
                 int T = (int)e->aux;
                 int D = (int)e->aux2;
                 int has_gamma = (e->parent2 >= 0 && e->parent2 < g_tape.count);
                 float* gamma_data = NULL;
-                if (has_gamma) gamma_data = g_tape.entries[e->parent2].output->data;
+                if (has_gamma) {
+                    nt_tensor_sync_cpu(g_tape.entries[e->parent2].output);
+                    gamma_data = g_tape.entries[e->parent2].output->data;
+                }
 
                 float* gx = (float*)calloc(T * D, sizeof(float));
                 float* gg = has_gamma ? (float*)calloc(D, sizeof(float)) : NULL;
