@@ -103,6 +103,22 @@ type Config struct {
 	// binary runs unchanged on macOS / non-CUDA hosts; on a CUDA pod the
 	// --gpu flag plus a successful gpu_init() enables the fast path.
 	UseGPU                 bool    `json:"use_gpu"`
+
+	// CrossGraze enables Dario-style cross-organism logit injection during
+	// generation (cross_graze.go). Each organism's MaybeRefresh() reads recent
+	// DNA fragments mirrored to ../dna/seen/<sibling>/ by dnaRead, tokenises
+	// them, and Apply() adds a rank-decay coef boost to those token ids in
+	// the overlay'd logits before sampling. Default off; activate with
+	// --cross-graze. Requires --element to be set (single-organism runs have
+	// no peers).
+	CrossGraze             bool    `json:"cross_graze"`
+	// CrossGrazeCoef — weightless-mode coefficient on the rank-1 token. Falls
+	// off as coef/(1+rank). Default 2.0 matches Q's c_doc-equivalent
+	// magnitude (postgpt_q.c:1361 weightless-regime range).
+	CrossGrazeCoef         float64 `json:"cross_graze_coef"`
+	// CrossGrazeTopN — how many most-recent tokens per sibling participate.
+	// Default 8 mirrors Q's interf_signal_chunk MAX_HEAVY/2 effective use.
+	CrossGrazeTopN         int     `json:"cross_graze_top_n"`
 	MetaCBigram            float64 `json:"meta_c_bigram"`
 	MetaCTrigram           float64 `json:"meta_c_trigram"`
 	MetaCHebbian           float64 `json:"meta_c_hebbian"`
@@ -230,6 +246,8 @@ var CFG = Config{
 	FreezeAfterGrowthSteps: 500,
 	PostGrowthLRScale:      0.3,
 	WarmupSteps:          400,
+	CrossGrazeCoef:       2.0, // Q-style weightless-regime c_doc magnitude
+	CrossGrazeTopN:       8,   // last 8 sibling tokens per buffer at rank-decay
 	MicroSteps:           32,
 	LearningRate:         0.01,
 	Beta1:                0.9,
@@ -1710,6 +1728,11 @@ type GPT struct {
 	lastWarmupStage       int // last stage that completed warmup (-1 = none)
 
 	corpusField *CooccurField // set by backgroundTrainer for adaptive blend
+
+	// crossField — Dario-style cross-organism logit injection state. Set by
+	// main() when --cross-graze + --element are both passed (cross_graze.go).
+	// Nil = no cross-pollination (single-organism or evolution without flag).
+	crossField *CrossField
 
 	// consciousness state
 	deltaAlphaScale          float64   // conscience: multiplier on all delta contributions (1.0 = normal)
@@ -4430,6 +4453,22 @@ func GenerateResonant(model *GPT, tok *EvolvingTokenizer, field *CooccurField, p
 			}
 		}
 
+		// Cross-organism logit injection (cross_graze.go). Adds a rank-decay
+		// boost to sibling organisms' recent emitted token ids on top of the
+		// overlay'd logits. Dario's interf_signal_chunk pattern with
+		// «слова, метрики и проч» from peers instead of docs. No-op when
+		// model.crossField is nil (no --cross-graze or no --element). Hook
+		// runs on overlaidLogits if overlay is on, else on logits.Data — so
+		// the boost composes regardless of overlay regime.
+		if model.crossField != nil {
+			model.crossField.MaybeRefresh(tok)
+			target := overlaidLogits
+			if !overlayActive {
+				target = logits.Data
+			}
+			model.crossField.Apply(target, CFG.CrossGrazeCoef, CFG.CrossGrazeTopN)
+		}
+
 		// Q-style untrained-regime early-step greedy: postgpt_q.c:1416-1418 —
 		// when there are no transformer weights, the first 10 tokens are taken
 		// as argmax(raw logits). This locks onto the strongest bigram/trigram
@@ -5776,6 +5815,13 @@ func parseCLIArgs() (organismID string, configPath string, element string, evolu
 			// CPU/BLAS — autograd graph requires host tensors. See
 			// gpu_bindings_linux.go + gpu_forward.go.
 			CFG.UseGPU = true
+		} else if os.Args[i] == "--cross-graze" {
+			// Dario-style cross-organism logit injection — read sibling DNA
+			// emissions mirrored to ../dna/seen/<sibling>/ and boost their
+			// recent token ids in the overlay'd logits before sampling. See
+			// cross_graze.go. Requires --element to be set so the field
+			// knows which siblings to scan.
+			CFG.CrossGraze = true
 		}
 	}
 	return
@@ -6431,6 +6477,16 @@ func main() {
 	// Enable BPE in main before REPL starts (avoid race with background trainer)
 	tok.MaybeEnableBPE(docs)
 	model.MaybeExpandVocab(tok.VocabSize)
+
+	// Cross-organism graze field — Dario-style logit injection from sibling
+	// emissions, mirrored to ../dna/seen/<sibling>/ by dnaRead (commit
+	// e5c1685). Active only when --cross-graze AND --element are set; the
+	// hook in GenerateResonant is a no-op when crossField is nil.
+	if CFG.CrossGraze && element != "" {
+		model.crossField = NewCrossField(element, "../dna/seen")
+		fmt.Fprintf(os.Stderr, "[graze] %s cross-organism injection enabled (coef=%.2f topN=%d)\n",
+			element, CFG.CrossGrazeCoef, CFG.CrossGrazeTopN)
+	}
 
 	// Swarm ecology: register in mesh
 	swarm := NewSwarmRegistry(organismID, element)
