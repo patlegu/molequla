@@ -435,6 +435,79 @@ Before each micro-burst training, the organism snapshots its personality via gam
 
 ---
 
+## The Coherence Layer
+
+Two opt-in passes that lift early-stage generation from Karpathy gibberish toward sentence-level coherence — **without touching weights**.
+
+A 10M-param adult organism after one hour on CPU still drifts. Quantitative speed-up does not close that gap. The coherence layer is a different mechanism: it sits at generation time, layers statistical priors and post-hoc connectedness checks on top of model logits, and lifts the floor without retraining the transformer.
+
+Both passes default **off**. The pre-coherence-layer behaviour is preserved exactly. Toggling either or both, on the same weights / prompts / seeds, is what RunPod measurement compares.
+
+### SPA — Sentence Phonon Attention
+
+After `GenerateResonant` returns a response, the chain is split on sentence boundaries (`.` `!` `?`, min 4 chars). For each sentence:
+
+1. Token IDs decoded; BOS/EOS sentinels stripped (otherwise shared sentinels dominate every sentence embedding and all sentences look artificially connected).
+2. **spa_embed** — exponentially weighted mean of token embeddings (`alpha^(n-1-i)`, default α=0.85), L2 normalised. One [D]-vector per sentence.
+3. **spa_connectedness** — bidirectional cross-attention dot-product between sentence embeddings, scaled by `1/√D`, summed per sentence.
+4. **Weak-sentence gate** — sentence i is weak iff `score[i] < 0.6 × mean(scores)`.
+
+```
+[spa-gate] S=4 D=320 alpha=0.85 scores=[12.4 11.8 3.1 10.9] weak=[2]
+```
+
+Reseed of weak sentences (regenerate from neighbour-context tokens, splice back, re-score) is a follow-up step. The wired gate currently logs only — generation output is unchanged. What the measurement run captures is the signal: how often the gate fires before vs after the rest of the layer.
+
+Available as both vendored AML ops (`spa_embed` / `spa_connectedness`, `ariannamethod/ariannamethod.c`) and pure-Go helper (`spa_coherence.go`, 135 lines, called from `GenerateResonant`). Pure Go for the runtime path because the math is trivial — embed + L2 + dot-products — and per-sentence CGO crossings would dwarf the work.
+
+Enable: `./molequla_cgo --spa-gate ...`
+
+### Q-style Additive Logit Overlay (B + H + A + F)
+
+Molequla's existing CooccurField blend lives in **probability space** — convex `tokenAlpha·model + (1-tokenAlpha)·corpus`. The overlay lives in **logit space** — additive bias before softmax, with explicit coefficients per signal class. Different mechanic, different sharpness: a strong corpus signal can dominate model preferences in a way prob-space convex blend cannot. Useful precisely when transformer is immature and statistical priors should lead.
+
+Five signals, all routed from existing organism state — no new inputs, no new training:
+
+| Signal | Code | Default | Source |
+|--------|------|---------|--------|
+| **B** Bigram   | `c_bg`  | 15.0 | `field.BigramByFirst[ids[-1]]` |
+| **T** Trigram  | `c_tg`  | 10.0 | `field.TrigramByContext[[2]int{ids[-2], ids[-1]}]` |
+| **H** Hebbian  | `c_heb` | 1.0  | `field.CooccurWindow[c][tid]` over recent window |
+| **A** Destiny  | `c_ds`  | 0.15 | `model.GammaContrastiveProjection()` projected onto each `wte` row |
+| **F** Prophecy | `c_pro` | 0.7  | persistent expectation field, ages by ×0.95/step, **collapses on the chosen token** |
+
+```
+overlaidLogits[i] = logits[i]
+                  + c_bg ·log(p_bigram[i])
+                  + c_tg ·log(p_trigram[i])
+                  + c_heb·log(p_cooccur[i])
+                  + c_ds ·destinyBias[i]
+                  + c_pro·log(p_prophecy[i])
+```
+
+Log-floor `1e-6` for unseen tokens (prevents `-inf` mask). Each coefficient is independently tunable via CFG — set any to 0 to disable that signal while keeping others.
+
+The prophecy field is the interesting one: it carries **across sampling steps**. First overlay step seeds from trigram-by-context (primary) plus 0.5×bigram-by-prev (fallback), normalised to unit total. Subsequent steps multiply the field by 0.95 — old expectations fade. After `TopKTopPSample` returns the chosen token, that token's prophecy is zeroed: the field shifts toward what is still unsaid.
+
+Destiny is the second interesting one. `GammaContrastiveProjection()` returns the unit direction of personality drift from birth — the organism's identity vector. Projecting each `wte` row onto it gives a per-token bias that pulls generation in the direction the organism has been growing. Tokens aligned with identity get amplified; tokens orthogonal get suppressed.
+
+Defaults are Q's weightless coefficients — calibrated for the regime where the transformer is immature and statistical priors should lead. Coexists with the legacy post-softmax prob-blend; both signals layer when overlay is on.
+
+Enable: `./molequla_cgo --corpus-overlay ...` (combine with `--spa-gate` for the full coherence-layer cell)
+
+### Phase A — Fundament Underneath
+
+Before the coherence layer landed, four fundament patches went into vendored AML + notorch:
+
+- **Opt-in SIMD shim** — `notorch_simd.h` (632 lines) + `notorch_simd_scalar.h` (89 lines), header-only AVX2+FMA cblas with pthread row-partitioning. Mirrors `cblas_sgemm` / `sgemv` / `sger` — existing call sites work unchanged. Build via `make simd` (x86_64 gated; arm64 errors cleanly with actionable message).
+- **Backward CPU-sync audit** — added `nt_tensor_sync_cpu` calls in NT_OP_MUL / NT_OP_SILU / NT_OP_RMSNORM / NT_OP_SEQ_RMSNORM backward paths. No-op on CPU-only build; becomes live when USE_CUDA path is enabled. Future-proofing + canonical consistency.
+- **NaN guard API** — `AM_NanGuard` struct + `am_nan_guard_check()` in vendored AML. Scans tape entries, zeros grads on NaN/Inf, halves loss_scale; doubles every `scale_window` clean steps. **API only — not yet wired** into the interpreter as `TAPE NAN_CHECK` opcode. Available to CGO consumers.
+- **Upstream sgemm alpha fix** — audit caught the SIMD shim post-scale path breaking CBLAS contract (`C ← α·β·C_orig + α·A@B` instead of `β·C_orig + α·A@B`). Fixed at canonical, vendored synced byte-identical.
+
+Total Phase A footprint: ~825 lines across 6 files. **Zero changes to default-build runtime behaviour.** Only `make simd` is opt-in via build flag; the rest are mirror-consistency or new API surface.
+
+---
+
 ## Self-Meta-Learning
 
 The organism doesn't just learn. It learns about its own learning.
@@ -700,6 +773,11 @@ for d in earth air water fire; do
     cd ..
 done
 
+# Optional coherence-layer flags (default off):
+#   --spa-gate         post-generation SPA sentence connectedness log
+#   --corpus-overlay   pre-softmax B+H+A+F additive logit overlay
+# Combine either or both for measurement runs.
+
 # They will:
 # 1. Train through all 6 ontogenesis stages (~30 min)
 # 2. Begin DNA exchange (writing/reading generated text)
@@ -749,12 +827,21 @@ bash tests/test_all.sh
 
 ```
 # Go + AML/C (primary, CGO training)
-molequla.go              6122 lines   Go organism — lifecycle, ecology, autograd, generation
-cgo_aml.go               80 lines     CGO bridge to ariannamethod.c
+molequla.go              6444 lines   Go organism — lifecycle, ecology, autograd, generation, coherence-layer wiring
+cgo_aml.go               112 lines    CGO bridge to ariannamethod.c
 aml_trainer.go           326 lines    AML training wrapper, script generation
+spa_coherence.go         135 lines    Pure-Go SPA helper (sentence connectedness + weak-sentence gate)
 ariannamethod/
-  ariannamethod.c        6000+ lines  AML/C autograd engine (the language)
-  ariannamethod.h        889 lines    C header, 80+ field state parameters
+  ariannamethod.c        6263 lines   AML/C autograd engine (the language) + SPA ops + NaN guard API
+  ariannamethod.h        911 lines    C header, 80+ field state parameters
+  notorch.c              2849 lines   Vendored notorch core (+ backward CPU-sync audit)
+  notorch.h              503 lines    Vendored notorch header
+  notorch_simd.h         632 lines    Opt-in AVX2+FMA cblas shim (make simd, x86_64)
+  notorch_simd_scalar.h  89 lines     Scalar debug fallback for SIMD shim
+
+# Coherence-layer + RunPod plan (pre-paper cycle)
+runpod_plan_v1.md        321 lines    Singularity-mode plan for coherence-layer measurement run
+PROJECT_LOG.md           live         Per-project working log — Phase A + B steps with file:line refs
 
 # Full independent implementations
 molequla.c               6000+ lines  C organism — BLAS-accelerated, zero-dep single-file
