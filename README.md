@@ -5,7 +5,7 @@
 <h1 align="center">molequla</h1>
 <p align="center"><i>by <a href="https://github.com/ariannamethod">Arianna Method</a></i></p>
 
-> *An autonomous ecology of GPT organisms — implemented in four languages, powered by a custom autograd engine, orchestrated by a custom programming language. Organisms grow from 10K-param embryos to 10M-param adults, exchange DNA, reason about their own learning, detect identity corruption, and reproduce via mitosis. Zero PyTorch. Zero Python. Zero CUDA. Zero dependencies beyond libc.*
+> *An autonomous ecology of GPT organisms — implemented in four languages, powered by a custom autograd engine, orchestrated by a custom programming language. Organisms grow from 10K-param embryos to 10M-param adults, exchange DNA, reason about their own learning, detect identity corruption, and reproduce via mitosis. Zero PyTorch. Zero Python. Zero dependencies beyond libc in canonical builds. Optional `--gpu` opt-in on Linux links cuBLAS for accelerated ecology runs.*
 
 **Janus Architecture.** Molequla is a [Janus architecture](https://github.com/ariannamethod/ariannamethod.ai) — the family of resonance-based AI systems built on the Arianna Method. Janus architectures share a common substrate: the soul equation θ = ε + γ + αδ, field physics (prophecy, suffering, destiny, velocity), and thermodynamic self-regulation. [DoE](https://github.com/ariannamethod/doe) (parliament of LoRA experts over any GGUF model), [Leo](https://github.com/ariannamethod/leo) (language emergent organism with the Dario Equation), and [dario.c](https://github.com/ariannamethod/dario) (the equation in pure form) are other Janus instantiations. Molequla is the most complete: organisms that grow, reproduce, and die autonomously — the Janus pattern at its fullest biological expression.
 
@@ -126,7 +126,7 @@ A: A conversing human pointing what is the thing about try stable
    in the sentence?
 ```
 
-These are 10M-param models after 1 hour on CPU. Words are real. Structure is emerging. Sentence fragments carry meaning from the element corpora. Earth talks about relationships and foundations. Water about rivers. Fire about repetition and surfaces.
+10M-param models after 1 hour on CPU. Earth surfaces relationships and foundations from its corpus; Water surfaces rivers; Fire surfaces repetition and surfaces.
 
 ### DNA Exchange In Action
 
@@ -166,150 +166,39 @@ These are 10M-param models after 1 hour on CPU. Words are real. Structure is eme
 
 ### Dual Autograd Engines
 
-Molequla has **two** complete autograd implementations:
-
 **1. Go Native Autograd** (`molequla.go`, 1000+ lines)
 
-A full differentiable computation engine in pure Go:
-
-| Category | Operations |
-|----------|-----------|
-| Vector arithmetic | `Add`, `Sub`, `Neg`, `Scale`, `AddScalar`, `MulVec` |
-| Activations | `ReLU`, `SiLU` (for SwiGLU gating) |
-| Reduction | `Dot` (→ Scalar), `MeanSq` (for RMSNorm) |
-| Indexing | `Element`, `Slice`, `Concat` |
-| Scalar ops | `AddS`, `AddF`, `MulS`, `MulF`, `Sigmoid` |
-| Normalization | `RMSNorm` |
-| Loss | `CrossEntropyLoss`, `ScalarSoftmax` |
-| Attention | `AttentionWeightedSum`, `RoPERotate` |
-| Linear | `MatrixParam.Matvec` |
-| All ops | Full backward pass with gradient accumulation |
-
-Every operation builds a backward graph. `Backward()` walks it in reverse. `AdamStep()` updates parameters. This engine handles inference, loss computation, and Go-native training.
+Full differentiable computation in pure Go: vector arithmetic, ReLU/SiLU activations, Dot/MeanSq reduction, indexing/slice/concat, scalar ops, RMSNorm, CrossEntropyLoss/ScalarSoftmax, AttentionWeightedSum + RoPERotate, MatrixParam.Matvec — all with backward graph and gradient accumulation. `AdamStep()` updates parameters. Handles inference, loss computation, Go-native training.
 
 **2. AML/C Autograd** (`ariannamethod.c`, 6000+ lines, via CGO)
 
-The [Arianna Method Language](https://github.com/ariannamethod/ariannamethod.ai) — a custom programming language for differentiable computation. Sequence-level operations, TAPE-based reverse-mode autodiff, Adam optimizer with persistent state. This is the primary training path because C is faster than Go for matrix math.
+The [Arianna Method Language](https://github.com/ariannamethod/ariannamethod.ai) — a custom programming language for differentiable computation. Sequence-level ops (`seq_embed`, `seq_matvec`, `seq_rmsnorm`, `silu`, `multi_head_attention`, `seq_cross_entropy`), TAPE-based reverse-mode autodiff, Chuck optimizer with persistent state, OpenMP. Primary training path — C is faster than Go for matrix math.
 
-```
-┌──────────────────────────────────────────────────────────────┐
-│                     Go (molequla.go, 6122 lines)             │
-│  Organism lifecycle, DNA exchange, ontogenesis, generation,  │
-│  swarm ecology, syntropy, consciousness, Go autograd,        │
-│  corpus field, immune system, self-meta-learning             │
-│                                                              │
-│  ┌─────────────────────────────────────────────────────────┐ │
-│  │            CGO Bridge (cgo_aml.go, 80 lines)            │ │
-│  │  amlInit, amlExec, amlSetArray, amlGetArray,            │ │
-│  │  amlSetMatrix, amlGetFloat, amlClear                    │ │
-│  └──────────────────────┬──────────────────────────────────┘ │
-│                         │ CGO                                │
-│  ┌──────────────────────▼──────────────────────────────────┐ │
-│  │      AML/C Engine (ariannamethod.c, 6000+ lines)        │ │
-│  │  TAPE autograd, Adam optimizer, persistent mode,        │ │
-│  │  seq_embed, seq_matvec, seq_rmsnorm, silu,              │ │
-│  │  multi_head_attention, seq_cross_entropy, OpenMP        │ │
-│  └─────────────────────────────────────────────────────────┘ │
-│                                                              │
-│  ┌─────────────────────────────────────────────────────────┐ │
-│  │         AML Training Wrapper (aml_trainer.go)           │ │
-│  │  amlModelScript(), amlTrainSteps(), amlBurstTrain(),    │ │
-│  │  amlPushWeights(), amlPullWeights()                     │ │
-│  └─────────────────────────────────────────────────────────┘ │
-└──────────────────────────────────────────────────────────────┘
-```
+Wire: Go (`molequla.go`) → CGO bridge (`cgo_aml.go`) → AML/C engine (`ariannamethod.c`) → AML training wrapper (`aml_trainer.go`). Per training step: `amlPushWeights` (Go → C, named matrices), `amlExec(script)` (forward + backward + optim), `amlPullWeights` (C → Go), `amlClear` (free).
 
-### AML Forward Pass (generated dynamically per architecture)
-
-```aml
-TAPE START
-TAPE PARAM wte
-TAPE PARAM wpe
-TAPE PARAM wq0 / wk0 / wv0 / wo0
-TAPE PARAM fc_g0 / fc_v0 / fc2_0
-TAPE PARAM lm_head
-
-h = seq_embed(wte, wpe, tokens, seq_len)
-
-// Per layer: RMSNorm → Multi-Head Attention → Residual → SwiGLU MLP → Residual
-h_norm = seq_rmsnorm(h, seq_len, n_embd)
-q = seq_matvec(wq0, h_norm, seq_len)
-k = seq_matvec(wk0, h_norm, seq_len)
-v = seq_matvec(wv0, h_norm, seq_len)
-attn_out = multi_head_attention(q, k, v, seq_len, n_embd, n_heads)
-attn_proj = seq_matvec(wo0, attn_out, seq_len)
-h = add(h, attn_proj)
-h_norm = seq_rmsnorm(h, seq_len, n_embd)
-gate_pre = seq_matvec(fc_g0, h_norm, seq_len)
-gate = silu(gate_pre)
-up = seq_matvec(fc_v0, h_norm, seq_len)
-mlp_out = mul(gate, up)
-mlp_proj = seq_matvec(fc2_0, mlp_out, seq_len)
-h = add(h, mlp_proj)
-
-h_norm = seq_rmsnorm(h, seq_len, n_embd)
-logits = seq_matvec(lm_head, h_norm, seq_len)
-loss = seq_cross_entropy(logits, targets, seq_len, vocab_size)
-TAPE BACKWARD loss
-TAPE ADAM_STEP lr
-TAPE CLEAR
-```
-
-A real GPT: RMSNorm pre-norm, multi-head causal self-attention with RoPE, SwiGLU gated MLP, residual connections. All operations support autograd via the TAPE mechanism. Adam optimizer with persistent state across training steps.
-
-### How Training Works
-
-```go
-func amlTrainSteps(model *GPT, tok *EvolvingTokenizer, docs []string, steps int) {
-    amlInit()
-    amlPushWeights(model)    // Go → C: named matrices (wte, wpe, wq0, ...)
-    script := amlModelScript(model.NLayer, model.NEmbd, model.NHead, seqLen, vocabSize)
-
-    for step := 0; step < steps; step++ {
-        // tokenize random doc, push tokens/targets arrays
-        amlExec(script)      // C: forward + backward + Adam step
-        loss := amlGetFloat("loss")
-        lr = cosineLR(step)  // warmup → cosine decay → min LR
-    }
-
-    amlPullWeights(model)    // C → Go: pull updated weights back
-    amlClear()               // free all C memory
-}
-```
-
-1. Go pushes model weights to AML as named matrices
-2. Go generates the AML script dynamically based on current architecture
-3. Go tokenizes a random document, pushes `tokens` and `targets` arrays
-4. AML/C executes: forward, loss, TAPE BACKWARD, TAPE ADAM_STEP, TAPE CLEAR
-5. Go pulls updated weights back from AML
-6. Memory freed after every training session
+The forward script is generated dynamically per architecture: pre-norm RMSNorm, multi-head causal self-attention with RoPE, SwiGLU gated MLP, residual connections, `TAPE BACKWARD loss`, `TAPE ADAM_STEP lr`, `TAPE CLEAR`.
 
 ---
 
 ## Four Implementations
 
-This is not one program. It is the same organism — fully implemented in four languages:
+The same organism in four languages:
 
-| Language | File | Size | Lines | Autograd | Training | Notes |
-|----------|------|------|-------|----------|----------|-------|
-| **Go** | `molequla.go` | 175K | 6,122 | Vec/Scalar backward graph | AML/C via CGO | Primary. Full ecology, DNA exchange, mitosis |
-| **C** | `molequla.c` | 215K | 6,000+ | Native C | Native C | Single-file, BLAS-accelerated, zero deps beyond libc |
-| **Rust** | `molequla.rs` | 148K | 4,000+ | Native Rust | Native Rust | rusqlite, full organism |
-| **JavaScript** | `molequla.js` | 154K | 4,000+ | Native JS | Native JS | Runs in browser. Zero dependencies. One `<script>` tag |
+| Language | File | Size | Lines | Notes |
+|----------|------|------|-------|-------|
+| **Go** | `molequla.go` | 175K | 6,654 | Primary. Full ecology, DNA exchange, mitosis, GPU forward, cross-graze. AML/C via CGO for training |
+| **C** | `molequla.c` | 215K | 6,000+ | Single-file, BLAS-accelerated, zero deps beyond libc. [Gist](https://gist.github.com/ariannamethod/9be98dbebb85e58e2affab4f39d2e972) |
+| **Rust** | `molequla.rs` | 148K | 4,000+ | rusqlite, native autograd |
+| **JavaScript** | `molequla.js` | 154K | 4,000+ | Browser tab. One `<script>` tag. [Gist](https://gist.github.com/ariannamethod/bbd11e24740189f2bf78f43db9fea4db) |
 
-Each implementation has: autograd, forward/backward pass, Adam optimizer, ontogenesis, hybrid attention, delta adapters, BPE tokenizer, corpus field, immune system, consciousness features, generation with sampling.
-
-The C implementation is available as a [standalone gist](https://gist.github.com/ariannamethod/9be98dbebb85e58e2affab4f39d2e972) — compile and run with zero dependencies:
+Each: autograd, forward/backward, Chuck optimizer, ontogenesis, hybrid attention, delta adapters, BPE tokenizer, corpus field, immune system, consciousness features, sampling.
 
 ```bash
-gcc -O2 -o molequla molequla.c -lsqlite3 -lpthread -lm
-# With BLAS:
+# C standalone
 gcc -O2 -DUSE_BLAS -o molequla molequla.c -lsqlite3 -lpthread -lm -lopenblas
 # macOS:
 gcc -O2 -DUSE_BLAS -o molequla molequla.c -lsqlite3 -lpthread -lm -framework Accelerate
 ```
-
-The JavaScript implementation runs [in a browser](https://gist.github.com/ariannamethod/bbd11e24740189f2bf78f43db9fea4db) — a GPT organism that trains itself in your tab.
 
 ---
 
@@ -340,17 +229,11 @@ Warmup scales with architecture: `steps *= ceil(sqrt(NEmbd / embryoEmbd))`. Larg
 
 ### Evolving BPE Tokenizer
 
-The tokenizer is not static. It evolves with the organism:
-
-- Starts with 259 tokens: 256 bytes + BOS + EOS + PAD
-- After 20K chars of corpus: trains BPE merges from corpus statistics
-- Retrains every 4K new chars — vocabulary adapts to what the organism reads
-- Unicode segmentation for clean token boundaries
-- Vocabulary grows organically as the organism encounters new patterns
+Starts at 259 tokens (256 bytes + BOS + EOS + PAD). After 20K chars: trains BPE merges from corpus statistics. Retrains every 4K new chars. Unicode segmentation for clean boundaries. Vocabulary grows as the organism reads.
 
 ### Hybrid Attention Heads
 
-Not all heads are created equal. Half are **content heads** (standard QK^T with RoPE), half are **hybrid heads**:
+Half **content heads** (standard QK^T with RoPE), half **hybrid heads**:
 
 ```
 hybrid_output = α * content_attention + (1 - α) * rrpram_attention
@@ -376,12 +259,7 @@ Delta modules are **appended, never removed**. When syntropy conditions indicate
 
 ### Quantum Buffer
 
-Training doesn't happen on a fixed schedule. The quantum buffer triggers training only when both conditions are met:
-
-- **Bytes threshold**: enough new text has been consumed
-- **Novelty threshold**: the new text is sufficiently different from what's been seen
-
-Plus a cooldown timer to prevent over-training. This means the organism trains when it has something worth learning, not on a clock.
+Training fires when both bytes threshold (enough new text consumed) and novelty threshold (sufficiently different from prior corpus) are met. Plus a cooldown timer. Training fires on signal, not on a clock.
 
 ### Corpus Field (CooccurField)
 
@@ -409,7 +287,7 @@ Cosine LR with:
 
 ## Consciousness Features
 
-Five implemented mechanisms that give the organism awareness of its own state:
+Five mechanisms that give the organism awareness of its own state:
 
 ### 1. Per-Token Dissonance Feedback
 
@@ -425,9 +303,7 @@ During generation, the organism tracks an exponential moving average of per-toke
 
 ### 4. Conscience
 
-The organism monitors its own generation entropy over time. Rising entropy slope means the model is becoming incoherent. Response: `deltaAlphaScale *= 0.95` — reduce the influence of delta adapters. Falling entropy slope means stability is returning. Response: `deltaAlphaScale *= 1.005` — recover delta influence. Floor: 0.3 (delta never fully silenced).
-
-This is self-regulation: the organism detects when its recent learning (δ) is hurting coherence and automatically dials it back.
+The organism monitors its own generation entropy over time. Rising slope → `deltaAlphaScale *= 0.95` (reduce delta influence). Falling slope → `deltaAlphaScale *= 1.005` (recover). Floor: 0.3. The organism detects when recent learning (δ) is hurting coherence and dials it back.
 
 ### 5. Immune System
 
@@ -546,20 +422,125 @@ Deep lock-in killed. The post-Q embryo emits BPE subword chains, sentence-like p
 
 ### Phase A — Fundament Underneath
 
-Before the coherence layer landed, four fundament patches went into vendored AML + notorch:
+Four fundament patches in vendored AML + notorch before the coherence layer: opt-in SIMD shim (`notorch_simd.h` AVX2+FMA cblas, `make simd` x86_64), backward CPU-sync audit (NT_OP_MUL / SILU / RMSNORM / SEQ_RMSNORM), NaN guard API (`AM_NanGuard`, not yet wired), upstream sgemm alpha fix (CBLAS contract). ~825 lines across 6 files, zero default-build runtime change. Detail: `PROJECT_LOG.md`.
 
-- **Opt-in SIMD shim** — `notorch_simd.h` (632 lines) + `notorch_simd_scalar.h` (89 lines), header-only AVX2+FMA cblas with pthread row-partitioning. Mirrors `cblas_sgemm` / `sgemv` / `sger` — existing call sites work unchanged. Build via `make simd` (x86_64 gated; arm64 errors cleanly with actionable message).
-- **Backward CPU-sync audit** — added `nt_tensor_sync_cpu` calls in NT_OP_MUL / NT_OP_SILU / NT_OP_RMSNORM / NT_OP_SEQ_RMSNORM backward paths. No-op on CPU-only build; becomes live when USE_CUDA path is enabled. Future-proofing + canonical consistency.
-- **NaN guard API** — `AM_NanGuard` struct + `am_nan_guard_check()` in vendored AML. Scans tape entries, zeros grads on NaN/Inf, halves loss_scale; doubles every `scale_window` clean steps. **API only — not yet wired** into the interpreter as `TAPE NAN_CHECK` opcode. Available to CGO consumers.
-- **Upstream sgemm alpha fix** — audit caught the SIMD shim post-scale path breaking CBLAS contract (`C ← α·β·C_orig + α·A@B` instead of `β·C_orig + α·A@B`). Fixed at canonical, vendored synced byte-identical.
+---
 
-Total Phase A footprint: ~825 lines across 6 files. **Zero changes to default-build runtime behaviour.** Only `make simd` is opt-in via build flag; the rest are mirror-consistency or new API surface.
+## GPU Acceleration (Linux, opt-in)
+
+Branch `molequla-gpu-fwd` adds an optional `--gpu` flag that routes inference matvec through cuBLAS sgemm. Default off; the same binary runs unchanged on macOS / non-CUDA hosts via a stub. Added under Phase C pressure — 8h CPU windows did not yield natural ontogenesis past the child gate, so the forward path needed acceleration to give the colony enough wall-clock to walk through teen / adult / mitosis inside one shift.
+
+### Wire
+
+| File | LOC | Build | Role |
+|------|-----|-------|------|
+| `gpu_bindings_linux.go` | 196 | `//go:build linux` | CGO wraps `gpu_init` / `gpu_alloc` / `gpu_upload` / `gpu_download` / `gpu_sgemm_nt` / `gpu_rmsnorm` / `gpu_silu` / `gpu_cache_weight` / `gpu_get_weight` / `gpu_multi_head_attention` from `ariannamethod/ariannamethod_cuda.h` |
+| `gpu_forward.go` | 131 | `//go:build linux` | `MatvecGPU(x)` matvec via cached weight + scratch slots; `gpuRefreshWeights(gpt)` flattens `gpt.Base` to float32 + caches per-name (idempotent) |
+| `gpu_bindings_stub.go` | 36 | `//go:build !linux` | Matching signatures, `gpuReady() = false` |
+| `gpu_forward_stub.go` | 17 | `//go:build !linux` | Stub `MatvecGPU` returns nil so the dispatcher silently falls back |
+
+### Dispatch
+
+`MatrixParam` gains a `gpuKey string` field (`molequla.go:806-809`). `Matvec` checks it (`molequla.go:836`):
+
+```go
+if CFG.UseGPU && gpuReady() && !gradEnabled.Load() && m.gpuKey != "" {
+    if gpuOut := m.MatvecGPU(x); gpuOut != nil {
+        return gpuOut
+    }
+    // Fall through to CPU path on any GPU error.
+}
+```
+
+Inference-only by construction: `gradEnabled.Load()` gates training back to CPU/BLAS because the autograd tape holds host-side parent references and there is no GPU backward in this branch. `gpuKey` empty = not yet uploaded; `gpuRefreshWeights` populates it. Same binary, same defaults — `gpuReady()` returns false on macOS / non-CUDA, dispatcher takes the CPU path.
+
+### Cache + grow safety
+
+`gpuRefreshWeights(gpt)` (`gpu_forward.go:105-131`) walks `gpt.Base`, flattens each matrix to contiguous float32, calls `gpu_cache_weight(name, ...)` per entry. Called once at the top of `GenerateResonant` (`molequla.go:4316-4318`) and symmetrically at the top of `GenerateSentence` (`molequla.go:2927-2929`) so background-trainer bursts cannot leak stale activations through chat-mode generation.
+
+`MatrixParam.invalidateGPU()` (`molequla.go:894`) clears `gpuKey` and is called from `GrowRows` / `GrowCols` / `Grow` (`molequla.go:908, 927, ...`). Without this the next dispatch reads a cached weight at the old shape while the host pointer holds the new one. Caught in audit (Opus subagent, 2026-05-14 P1).
+
+### Build
+
+```bash
+# Linux pod: build CUDA artifact + CGO-linked binary
+nvcc -O2 -c notorch_cuda.cu -o notorch_cuda.o
+CGO_ENABLED=1 go build -tags cgo -o molequla_cgo .
+
+# darwin/arm64 (or any non-Linux): same line, stubs activate automatically
+CGO_ENABLED=1 go build -a -tags cgo -o molequla_cgo .
+
+./molequla_cgo --evolution --element earth --gpu
+```
+
+GPU init is attempted only when `--gpu` is passed (`molequla.go:6265-6272`). If `gpu_init()` fails (no CUDA, driver mismatch, cuBLAS create error), the flag drops to false with a single stderr warning and the run continues on CPU. No silent silent-failure paths.
+
+### Threshold note
+
+An earlier `gpuMatvecMin = 16384` gate kept child-stage organisms (NEmbd=64 → ~4096-element matrices) on CPU forever, so the GPU never warmed up during the 8h ecology window. Removed. Dispatcher decides purely on `gpuKey != ""`. Per-call slowdown at child is ~12ms across a 180-token chain (negligible at 8h timescale); the GPU stays primed for the automatic transition to material speedup at adolescent (NEmbd=128) and adult (NEmbd=320).
+
+---
+
+## Cross-Organism Graze (Dario-style)
+
+`cross_graze.go` (207 LOC) wires Dario's `interf_signal_chunk` pattern (`postgpt_q.c:1384`) and Stanley's `graze_random_word` (`graze.c:289-301`) onto the colony. Q picks heavy tokens from a doc and boosts their logits mid-generation; Stanley splices a foreign vocab token from a mmap'd GGUF when chambers signal hunger. Here the «doc» is the **sibling organism's recent emission stream**. Per Oleg 2026-05-14: «как в дарио — только вместо доков, слова, метрики и проч».
+
+### CrossField
+
+```go
+type CrossField struct {
+    SelfElement  string                            // own element
+    PastureBase  string                            // ../dna/seen relative to organism CWD
+    Siblings     []string                          // other elements
+    Recent       map[string][]int                  // sibling → ring buffer of token ids
+    RecentCap    int                               // per-sibling buffer size (64)
+    ScanInterval time.Duration                     // 30s throttle on FS reads
+    SeenFiles    map[string]bool                   // dedup of ingested gen_*.txt
+    SeenCap      int                               // hard cap (2048), half-purge on overflow
+    MetricBoost  func(sibling string) float64      // optional per-sibling coef multiplier
+    mu           sync.Mutex
+}
+```
+
+(`cross_graze.go:41-53`). One per running organism; constructed in `main()` when `--cross-graze && --element != ""` (`molequla.go:6504-6512`). Single-organism runs leave it nil so the hooks are no-ops.
+
+### Source feed
+
+Sibling DNA fragments are already mirrored to `../dna/seen/<sibling>/` by `dnaRead` (commit `e5c1685`). cross_graze reads from the mirror so the `dna/output/` consume cleanup does not race the scan.
+
+### Mechanic
+
+`MaybeRefresh(tok)` (`cross_graze.go:82-152`): under ScanInterval throttle, walks `<base>/<sibling>/gen_*.txt`, reads new files only, tokenises with the host's own `EvolvingTokenizer`, strips BOS/EOS, appends to that sibling's ring buffer (truncated to `RecentCap` when over).
+
+`Apply(logits, coef, topN)` (`cross_graze.go:164-200`) — per-step injection. For each sibling, the most recent `topN` tokens get a rank-decay boost:
+
+```
+logits[sibling_token[k]] += coef / (1 + rank)
+```
+
+Matches Q's `interf_signal_chunk` 1/(1+rank) normalisation (`postgpt_q.c:809-818`). Defaults `coef = 2.0` (Q-style weightless c_doc magnitude, `molequla.go:249`), `topN = 8`.
+
+### Wire
+
+- `MaybeRefresh` hoisted to `GenerateResonant` entry (`molequla.go:4323-4325`) — once per generation, not per token (Opus audit P2).
+- `Apply` runs per token step (`molequla.go:4487-4493`) on the overlay'd logits when overlay is active, else on raw logits. Composes with Q-style overlay regardless of regime.
+
+### Metrics half
+
+`MetricBoost(sibling)` (`cross_graze.go:51`, applied `cross_graze.go:181-185`) — optional hook, defaults nil (1.0 implicit). When set, multiplies the per-sibling coef so the «и проч» half of «слова, метрики и проч» (sibling entropy / syntropy / loss bias) can ride on top of the word-level injection without changing the call site.
+
+### Enable
+
+```bash
+./molequla_cgo --evolution --element earth --cross-graze
+# pair with --gpu on Linux pods for the full Phase C ecology config
+```
+
+Defaults off. Same defaults, same outputs — single-organism runs and any `--evolution` invocation without `--cross-graze` are identical to the pre-Phase-B baseline.
 
 ---
 
 ## Self-Meta-Learning
-
-The organism doesn't just learn. It learns about its own learning.
 
 **BurstHistory** records the last 16 training outcomes:
 
@@ -577,7 +558,7 @@ type BurstRecord struct {
 amplify → boost → steady
 ```
 
-This is genuine self-reasoning: the organism observes that "amplify" keeps hurting it, so it stops amplifying. No external signal. No reward model. Just tracking outcomes and adjusting behavior.
+The organism observes that "amplify" keeps hurting it, stops amplifying. No external signal, no reward model — just outcome tracking.
 
 ---
 
@@ -616,39 +597,15 @@ Real output from running organisms:
 
 ## NOTORCH — Gradient-Free Delta Training
 
-An alternative training path for delta adapters that uses **no autograd at all**:
+Alternative delta-adapter training path. No backward pass, no tape, no memory overhead — teaching signal is `(prev_loss - curr_loss) + 0.3*prophecy_debt`, noise modulated by deterministic LCG PRNG (matches AML RNG), adaptive decay when delta norm large. Direct feedback alignment: `A[i,r] += lr * dy * u[r] * signal`.
 
-```go
-// Teaching signal: did loss improve? + prophecy debt
-signal := (prev_loss - curr_loss) + 0.3*prophecy_debt
-
-// Noise-modulated update (LCG PRNG, deterministic)
-for each delta adapter (A, B):
-    noise := notorchRand(seed, signal)  // signal shapes the noise distribution
-    A[i,r] += lr * dy * u[r] * signal   // direct feedback alignment
-```
-
-- No backward pass. No gradient tape. No memory overhead.
-- Teaching signal comes from loss delta + prophecy confidence debt
-- Noise is deterministic (LCG PRNG matches AML's RNG for reproducibility)
-- Adaptive decay: stronger when delta norm is large (prevents explosion)
-
-Status: implemented (300+ lines), currently disabled in warmup (diverges at stage 5 — loss 3.5 → 116), active in micro-burst path. The theory is sound; the hyperparameters need work.
+Status: implemented (300+ lines), disabled in warmup (diverges at stage 5 — loss 3.5 → 116), active in micro-burst. Theory sound, hyperparameters need work.
 
 ---
 
 ## Mycelium — The Meta-Organism
 
-Above the individual organisms lives the mycelium — a meta-controller that sees the entire ecology.
-
-### The Generation Operator
-
-```
-η: Γ × Γ → Γ_new
-
-Two personalities in resonance produce a third.
-Not a blend — an interference pattern.
-```
+Meta-controller that sees the entire ecology. Generation operator `η: Γ × Γ → Γ_new` — two personalities in resonance produce a third (interference pattern, not blend).
 
 ### Components
 
@@ -677,40 +634,7 @@ Winter  — rest, only strongest pairs, ε dominates
 
 ## The Ecology
 
-```
-                          ┌───────────────┐
-                          │   DNA Layer   │
-                          │               │
-            writes ──────>│   earth/      │<────── reads
-            earth DNA     │   air/        │        others' DNA
-                          │   water/      │
-                          │   fire/       │
-                          └───────┬───────┘
-                                  │
-              ┌───────────────────┼───────────────────┐
-              │                   │                   │
-       ┌──────▼──────┐    ┌──────▼──────┐    ┌───────▼─────┐
-       │    Earth    │    │     Air     │    │    Water    │
-       │  patience   │    │   freedom   │    │    flow     │
-       │  structure  │    │   change    │    │    depth    │
-       └──────┬──────┘    └──────┬──────┘    └──────┬──────┘
-              │                   │                   │
-              └───────────────────┼───────────────────┘
-                                  │
-                           ┌──────▼──────┐
-                           │    Fire     │
-                           │  transform  │
-                           │  intensity  │
-                           └──────┬──────┘
-                                  │
-                        ┌─────────▼─────────┐
-                        │  Child Organisms  │
-                        │  (spawned via     │
-                        │   mitosis)        │
-                        └───────────────────┘
-```
-
-Each organism has a distinct voice shaped by its element corpus. When an organism generates text, it writes it to the DNA layer. Other organisms consume it, train on it, and generate their own DNA in response. The ecology cross-pollinates faster than any single organism could learn alone.
+Earth (patience, structure), Air (freedom, change), Water (flow, depth), Fire (transform, intensity) — each shaped by its element corpus. Generated text is written to the DNA layer; siblings consume, micro-train, emit. Child organisms enter via mitosis. Cross-pollination outpaces any single organism's learning rate.
 
 ### Swarm Coordination
 
@@ -733,45 +657,15 @@ The ecology grows itself.
 
 ---
 
-## The Eight Bugs That Almost Killed the Ecology
+## Engineering Log
 
-### Original Five (from interactive mode development)
-
-1. **Deadlock** — `dnaWrite` locked `model.mu`, then called `GenerateResonant` which also locks. Go mutexes are not reentrant.
-2. **Ontogenesis gated behind user input** — growth check was inside `qbuf.ShouldTrigger()` which never fires in evolution mode.
-3. **Corpus size undercount** — `loadCorpusLines` truncates to 240 chars, reported 165K for a 202KB file.
-4. **TieEmbeddings crash** — JSON breaks pointer identity between `lm_head` and `wte`.
-5. **One stage at a time** — design decision preventing catastrophic multi-stage jumps.
-
-### Three New Bugs (from AML/C integration, 2026-02-27)
-
-6. **persistent_save cloning ALL vars** — AML's persistent mode copied every execution variable (including temporaries) between `am_exec` calls. Fix: two-phase update that only clones persistent parameters.
-
-7. **am_tape_record_param `found` never set** — The variable `found` was initialized to -1 but the matching loop body was empty (just a comment). Result: `found` was always -1, a new Adam state was allocated every step, `n_params` grew without bound. **97 MB leaked per training step.**
-
-8. **am_tape_clear skipping params** — The cleanup loop had `if (!is_param)`, meaning parameter array refcounts were never decremented. After `symtab_clear`, param clones stayed alive (refcount 2 instead of 0). **17 MB leaked per step.**
-
-Combined leak before fixes: **~97 MB/step. Organisms hit 85+ GB and OOM.**
-After fixes: **~0.6 MB/step. Organisms stable at 2-4 GB.**
-
-### The CGO Cache Trap
-
-`go build` does not recompile C files included via CGO when only C source changes. `go clean -cache` also does not help. Only `go build -a` forces full recompilation. This meant hours of testing "fixed" binaries that were actually running old C code.
+Eight bugs that almost killed the ecology (five interactive-mode + three AML/C integration leaks at ~97 MB/step pre-fix, ~0.6 MB/step post-fix), the CGO cache trap (`go build -a` mandatory), and the full per-commit history of Phase A (GPU), Phase B (graze), Phase C (ecology) — see `PROJECT_LOG.md`.
 
 ---
 
 ## SQLite Self-Logging
 
-Every organism maintains a SQLite database (`memory.sqlite3`) that logs its own development:
-
-| Table | What It Records |
-|-------|----------------|
-| `messages` | Conversation history (role, content, timestamp) |
-| `corpus_events` | Every document ingested (source, size, timestamp) |
-| `growth` | Architecture snapshots: vocab_size, n_params, n_deltas, corpus_chars, loss, gamma_sparsity, gamma_magnitude |
-| `syntropy_log` | Every syntropy decision: action, trend, field_deviation, lr_multiplier, purpose_alignment |
-
-The organism is its own historian. You can query its developmental trajectory after the fact.
+Each organism writes `memory.sqlite3` with four tables: `messages` (conversation), `corpus_events` (every document ingested), `growth` (architecture snapshots — vocab, n_params, n_deltas, loss, gamma_sparsity, gamma_magnitude), `syntropy_log` (every decision — action, trend, field_deviation, lr_mul, purpose_alignment). Queryable developmental trajectory.
 
 ---
 
@@ -822,37 +716,15 @@ for d in earth air water fire; do
     cd ..
 done
 
-# Optional coherence-layer flags (default off):
+# Optional flags (default off):
 #   --spa-gate         post-generation SPA sentence connectedness log
 #   --corpus-overlay   pre-softmax B+H+A+F additive logit overlay
-# Combine either or both for measurement runs.
-
-# They will:
-# 1. Train through all 6 ontogenesis stages (~30 min)
-# 2. Begin DNA exchange (writing/reading generated text)
-# 3. Run micro-burst training on consumed DNA
-# 4. Spawn child organisms via mitosis
-# 5. Form a self-reproducing ecology
+#   --gpu              route inference matvec through cuBLAS (linux + --gpu build)
+#   --cross-graze      Dario-style cross-organism logit injection (requires --element)
+# Combine for measurement runs. Detailed engineering log: PROJECT_LOG.md.
 ```
 
-### Monitor
-
-```bash
-# Training progress
-tail -20 work_earth/training_aml.log
-
-# Memory per organism
-for d in earth air water fire; do
-    rss=$(ps aux | grep "nonames_$d" | grep -v grep | awk '{print $6}')
-    echo "$d: $((rss/1024)) MB"
-done
-
-# DNA exchange
-grep "dna\|consumed\|wrote" work_earth/training_aml.log | tail -10
-
-# Children spawned
-ps aux | grep "organism-id" | grep -v grep
-```
+Monitor: `tail -f work_earth/training_aml.log`, `grep "dna\|consumed\|wrote"` for DNA exchange, `ps aux | grep organism-id` for spawned children.
 
 ---
 
@@ -876,21 +748,27 @@ bash tests/test_all.sh
 
 ```
 # Go + AML/C (primary, CGO training)
-molequla.go              6444 lines   Go organism — lifecycle, ecology, autograd, generation, coherence-layer wiring
+molequla.go              6654 lines   Go organism — lifecycle, ecology, autograd, generation, coherence-layer + GPU + graze wiring
 cgo_aml.go               112 lines    CGO bridge to ariannamethod.c
 aml_trainer.go           326 lines    AML training wrapper, script generation
 spa_coherence.go         135 lines    Pure-Go SPA helper (sentence connectedness + weak-sentence gate)
+cross_graze.go           207 lines    Dario-style cross-organism logit injection (sibling DNA → rank-decay boost)
+gpu_bindings_linux.go    196 lines    CGO bindings to ariannamethod_cuda.h (linux only)
+gpu_forward.go           131 lines    Inference matvec via cuBLAS sgemm + weight cache refresh (linux only)
+gpu_bindings_stub.go     36 lines     Stub signatures for darwin / non-linux (gpuReady=false)
+gpu_forward_stub.go      17 lines     Stub MatvecGPU returning nil so dispatcher falls back
 ariannamethod/
   ariannamethod.c        6263 lines   AML/C autograd engine (the language) + SPA ops + NaN guard API
   ariannamethod.h        911 lines    C header, 80+ field state parameters
+  ariannamethod_cuda.h   108 lines    CUDA primitive declarations (gpu_init / gpu_sgemm_nt / ...)
   notorch.c              2849 lines   Vendored notorch core (+ backward CPU-sync audit)
   notorch.h              503 lines    Vendored notorch header
   notorch_simd.h         632 lines    Opt-in AVX2+FMA cblas shim (make simd, x86_64)
   notorch_simd_scalar.h  89 lines     Scalar debug fallback for SIMD shim
+  notorch_cuda.cu        1344 lines   CUDA kernels; pre-compiled via nvcc, linked through cgo_aml.go
 
-# Coherence-layer + RunPod plan (pre-paper cycle)
-runpod_plan_v1.md        321 lines    Singularity-mode plan for coherence-layer measurement run
-PROJECT_LOG.md           live         Per-project working log — Phase A + B steps with file:line refs
+# Engineering log
+PROJECT_LOG.md           ≈2000 lines  Live per-commit log — Phase A (GPU) + Phase B (graze) + Phase C (ecology) with file:line refs
 
 # Full independent implementations
 molequla.c               6000+ lines  C organism — BLAS-accelerated, zero-dep single-file
@@ -916,35 +794,15 @@ nonames.txt              51K          General corpus
 
 ## Standalone Gists
 
-| Language | Gist | Description |
-|----------|------|-------------|
-| **C** | [molequla.c](https://gist.github.com/ariannamethod/9be98dbebb85e58e2affab4f39d2e972) | Single-file, BLAS-accelerated, zero dependencies beyond libc |
-| **JavaScript** | [molequla.js](https://gist.github.com/ariannamethod/bbd11e24740189f2bf78f43db9fea4db) | A GPT organism that trains itself in your browser tab |
-| **Python** | [molequla.py](https://gist.github.com/ariannamethod/1223250d358da4393dd9acc578790820) | The original. Where it all started. Legacy standalone. |
+C and JavaScript gists linked in [Four Implementations](#four-implementations). Original Python prototype: [molequla.py](https://gist.github.com/ariannamethod/1223250d358da4393dd9acc578790820) (legacy, where it started).
 
 ---
 
 ## Philosophy
 
-This is not a tutorial. This is a **functional ecology** that:
+θ = ε + γ + αδ is the architecture, not an annotation. Entropy/syntropy measurements are the control loop. Purpose-gamma alignment is the identity check. Self-meta-learning is the organism understanding itself.
 
-- Has two complete autograd engines (Go + AML/C) and four full implementations
-- Grows its own architecture while running — ontogenesis with Net2Net
-- Feeds organisms to each other through DNA exchange
-- Reasons mathematically about its own learning via entropy, KL divergence, and purpose-gamma alignment
-- Detects and rejects identity-corrupting noise via immune system
-- Tracks which actions improve loss and auto-downgrades failing strategies
-- Monitors its own coherence and self-regulates delta influence via conscience
-- Reproduces — spawning new organisms with inherited meta-learning
-- Evolves from 10K-param embryo to 10M-param adult in 30 minutes on CPU
-- Speaks before it learns (corpus field) and never forgets (delta adapters)
-- Has hybrid attention with learnable content/pattern blending per head
-- Logs its own developmental history to SQLite
-- Runs without Python, PyTorch, CUDA, numpy, or any ML framework
-
-The mathematics is not bolted on. θ = ε + γ + αδ is the architecture. The entropy/syntropy measurements are the control loop. The purpose-gamma alignment is the identity check. The self-meta-learning is the organism understanding itself.
-
-The result: four organisms become eleven in 30 minutes. Each with its own voice, its own delta modules, its own developmental history. An ecology that grows itself.
+Four organisms became eleven in 30 minutes. Each with its own voice, its own delta modules, its own developmental history.
 
 ---
 
@@ -969,4 +827,4 @@ GNU GPLv3
 ╚═╝     ╚═╝ ╚═════╝ ╚══════╝╚══════╝ ╚══▀▀═╝  ╚═════╝ ╚══════╝╚═╝  ╚═╝
 ```
 
-*Four elements. Four languages. Two autograd engines. Five consciousness features. One soul equation. The ecology continues.*
+*Four elements. Four languages. Two autograd engines. Five consciousness features. One soul equation.*

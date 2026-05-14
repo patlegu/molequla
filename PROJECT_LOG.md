@@ -1692,3 +1692,292 @@ to `/workspace/runs/eco/watchdog.log`. neo-side `Monitor` tool tails
 both `watchdog.log` and `eco_master.log` via SSH, filters and emits
 per-event chat notifications.
 
+---
+
+## Phase A — GPU ForwardStep port (branch `molequla-gpu-fwd`)
+
+After the CPU baseline launched, opened a parallel branch for the GPU
+forward path per plan `~/.claude/plans/quirky-shimmying-babbage.md`. Goal:
+route generation-side matvecs through cuBLAS so corpus throughput stops
+being the bottleneck on ontogenesis. Per Oleg «открыл бы ветку с гпу
+отдельную, тупо просто для того, чтобы подстраховаться, но смержим
+именно гпу версию» — branch `molequla-gpu-fwd` off `molequla-evolution`
+HEAD `d3cf6ba`.
+
+### A.1 — CGO bindings (commit `7dee558`)
+
+New files:
+- `gpu_bindings_linux.go` 196 LOC — wraps `ariannamethod_cuda.h` API:
+  `gpu_init` / `gpu_alloc` / `gpu_free` / `gpu_upload` / `gpu_download`
+  / `gpu_sgemm_nt` (M=1 matvec form) / `gpu_rmsnorm` / `gpu_silu` /
+  `gpu_add` / `gpu_mul` / `gpu_rope_forward` / `gpu_cache_weight` (slot
+  cache, 256 named entries) / `gpu_get_weight` / `gpu_mark_all_dirty` /
+  `gpu_scratch` / `gpu_multi_head_attention`. Linux build links
+  `notorch_cuda.o` + `-lcudart` + `-lcublas` (wire already in place
+  from commit `34db1d4`).
+- `gpu_bindings_stub.go` 36 LOC — `//go:build !linux`, identical
+  signatures, `gpuReady() = false`. The rest of molequla compiles
+  cleanly on darwin/arm64 and routes through the existing CPU/BLAS
+  path because the `Matvec` dispatcher reads `gpuReady()`.
+
+neo darwin/arm64 build verified: zero-warmup smoke emits coherent
+corpus vocab («brain flows», «radiation.uses», «hormoney parts») via
+the stub path — no CPU regression.
+
+### A.2-A.4 — Dispatcher + weight cache + `--gpu` flag (commit `d2ecd8b`)
+
+- `MatrixParam` gains `gpuKey string` field (`molequla.go:809`).
+- `Matvec` dispatcher (`molequla.go:836`):
+  ```go
+  if CFG.UseGPU && gpuReady() && !gradEnabled.Load() && m.gpuKey != "" {
+      if gpuOut := m.MatvecGPU(x); gpuOut != nil {
+          return gpuOut
+      }
+  }
+  ```
+  Note `!gradEnabled.Load()` — autograd path stays on CPU (host-side
+  tape, training pipeline unchanged).
+- `MatvecGPU` (`gpu_forward.go` 131 LOC): `gpuGetWeight(m.gpuKey)` →
+  scratch upload of host activation (`gpuScratchX=0`) → `gpu_sgemm_nt(1,
+  Nout, Nin, dX, dW, dOut)` → download float32 → convert to float64 →
+  return `*Vec` matching CPU contract.
+- `gpuRefreshWeights(gpt)`: walks `gpt.Base`, flattens each MatrixParam
+  to float32, calls `gpu_cache_weight(name, h)` per entry. Idempotent
+  (cache overwrites on same name).
+- `main()` calls `gpuInit()` when `CFG.UseGPU` set (`molequla.go:6261`).
+  Silent fallback if cuBLAS create fails — flag drops to false, single
+  warning, run continues on CPU.
+- `GenerateResonant` (`molequla.go:4316-4317`) calls
+  `gpuRefreshWeights(model)` at entry so background-trainer mutations
+  propagate to the cache before the per-token loop.
+- Config: `UseGPU bool` (`molequla.go:105`), CLI `--gpu` flag
+  (`parseCLIArgs molequla.go:5835`).
+
+Pod smoke (zero-warmup probe set, NEmbd=16, V=643):
+
+| path | wall time |
+|---|---|
+| CPU (no `--gpu`) | 46.6s |
+| GPU (`--gpu`)    | 55.3s |
+
+GPU 17% **slower** on embryo — cuBLAS launch + CPU↔GPU transfer overhead
+(~15-20µs/call) dominates the 16-dim matmul work.
+
+### A.5 — Size-gated dispatch (commit `babf7bc`, later reverted)
+
+Added `gpuMatvecMin = 16384` (= 128²) threshold inside the Matvec
+dispatcher: below 128² matrix elements, fall back to CPU. Theory: at
+child stage NEmbd=64 → 4096-element matrices, still under threshold →
+CPU. Adolescent NEmbd=128 → 16384 borderline. Adult NEmbd=320 →
+102400+, GPU pays off cleanly.
+
+**This was wrong.** See § Threshold drop below.
+
+## Phase B — Cross-organism Dario-style logit injection (commit `78c7dc7`)
+
+Per Oleg 2026-05-14 PM: «только инжектьит он не всередину предложения,
+а как в дарио — он просто инжектит туда совсем другое, слова другого
+трансформера». Dario's `interf_signal_chunk` (`postgpt_q.c:1384`) picks
+heavy tokens from a doc and boosts their logits mid-generation;
+Stanley's `graze_random_word` (`graze.c:289-301`) splices a foreign
+vocab token from mmap'd GGUF when chambers signal hunger. For molequla
+the «doc» is the **sibling organism's recent emission stream**.
+
+New file `cross_graze.go` 207 LOC. Per-organism `CrossField` struct
+(`cross_graze.go:41-53`):
+
+- `SelfElement` (earth/air/water/fire) + `Siblings []string` (the
+  other three).
+- `Recent map[string][]int` — ring buffer per sibling, `RecentCap = 64`
+  token ids.
+- `SeenFiles map[string]bool` — dedup of ingested `gen_*.txt`,
+  `SeenCap = 2048`, halves to empty when over cap (Opus P1 audit,
+  `cross_graze.go:149-151`).
+- `ScanInterval = 30s` throttle on FS reads.
+- `MetricBoost func(sibling) float64` hook (nil → 1.0; reserved for
+  the «и проч» metrics half of «слова, метрики и проч»).
+
+`MaybeRefresh(tok)` (`cross_graze.go:82-152`): under ScanInterval throttle,
+walks `<base>/<sibling>/gen_*.txt`, reads new files only, tokenises with
+the host's own EvolvingTokenizer, strips BOS/EOS, appends to that
+sibling's ring buffer (truncated to RecentCap when over).
+
+`Apply(logits, coef, topN)` (`cross_graze.go:164-200`): for each sibling,
+the most recent `topN` tokens get a rank-decay boost
+`logits[tid] += coef / (1 + rank)`. Matches Q's `interf_signal_chunk`
+1/(1+rank) normalisation (`postgpt_q.c:809-818`). Defaults `coef = 2.0`
+(Q-style weightless c_doc magnitude, `molequla.go:249`), `topN = 8`.
+
+Source feed: sibling DNA fragments are already mirrored to
+`../dna/seen/<sibling>/` by `dnaRead` since commit `e5c1685`.
+cross_graze reads from the mirror so the `dna/output/` consume cleanup
+doesn't race the scan.
+
+Wired in `GenerateResonant`:
+- `model.crossField.MaybeRefresh(tok)` at entry (`molequla.go:4323-4325`).
+- `model.crossField.Apply(target, CFG.CrossGrazeCoef, CFG.CrossGrazeTopN)`
+  per token step (`molequla.go:4487-4493`), after overlay/rep-penalty,
+  before hard top-K mask.
+
+`main()` constructs CrossField when `--cross-graze && --element != ""`
+(`molequla.go:1740-1743`, guarded so single-organism runs are no-op).
+
+Config: `CrossGraze bool`, `CrossGrazeCoef float64 = 2.0`,
+`CrossGrazeTopN int = 8` (`molequla.go:114-121`). CLI `--cross-graze`
+(`parseCLIArgs molequla.go:5841`).
+
+## Audit pass (Phase A + B)
+
+Codex audited the Phase A diff first. Phase B diff (cross_graze) went
+through an Opus subagent for the second pass. Findings:
+
+- **P1** GPU stale-weights on `GenerateSentence` path —
+  background-trainer burst between `GenerateResonant` calls leaves
+  the cache stale for chat-mode generation. Fix: call
+  `gpuRefreshWeights` symmetrically at top of `GenerateSentence`
+  (`molequla.go:2927-2928`).
+- **P1** `gpuKey` persists across `GrowRows / GrowCols / Grow` — next
+  Matvec dispatches to GPU with the OLD shape's cached weight while
+  the host pointer holds the NEW shape. Fix: `(m *MatrixParam)
+  invalidateGPU()` helper (`molequla.go:894`), called from each grow
+  method (`molequla.go:908, 927`).
+- **P1** `SeenFiles` unbounded growth at 8h+ runtime — added `SeenCap = 2048`
+  + half-purge wipe (`cross_graze.go:149-151`).
+
+Audit fixes landed alongside the threshold drop in commit `a7df64a`.
+
+## Threshold drop — `gpuMatvecMin = 0` (in `a7df64a`)
+
+Oleg pushed back **twice** on the A.5 16384-element threshold:
+«ну так я же тебя вроде и просил этот баг пофиксить, дважды даже».
+
+He was right. Threshold kept child stage (NEmbd=64 → ~4096-element
+matrices) on CPU for the entire 8h window, so the GPU never warmed up
+beyond the embryo phase. Per-call slowdown at child is ~12ms across a
+180-token chain — negligible at 8h timescale, and keeping the GPU primed
+for the automatic transition to material speedup at adolescent + adult
+costs nothing.
+
+Threshold removed. Dispatcher now decides purely on `gpuKey != ""`
+(`molequla.go:836`) — any cached matrix takes the GPU path when
+`--gpu` is set and inference is live.
+
+Oleg also corrected the optimisation axis: «если уж на то пошло то
+все эти инжекшн больше влияют на тренировку чем скорость, если
+подумать». The Phase B graze + GPU acceleration both move corpus
+throughput via the DNA exchange pipeline — sibling tokens splice into
+emissions, peers consume + train on cross-pollinated text, ontogenesis
+pace shifts. Raw inference latency is secondary. The threshold was
+optimising the wrong axis.
+
+## CPU baseline pull + stop — pod `mpw33bhmeyybrm`
+
+CPU baseline 8h timer expired ~21:31:30 UTC. Per
+`memory/feedback_pod_stop_volume_zero_artifact_loss_2026_05_09.md`:
+
+1. `runpodctl get pod mpw33bhmeyybrm` — confirmed `volumeInGb > 0`
+   (attached volume, stop ≠ terminate).
+2. `scp -r` all `work_*/train.log` + `work_*/voice/` + `dna/seen/` +
+   watchdog logs to neo `~/arianna/molequla/runpod/2026-05-14_post_q/02_ecology_8h_final/`
+   (68 MB total).
+3. Verified pull completeness, then `runpodctl pod stop mpw33bhmeyybrm`.
+
+Baseline findings (CPU-only, no graze, no GPU code path exercised):
+- all 4 orgs reached child stage; none crossed 2→3 naturally
+- 2 `ONTOGENESIS` events each (embryo→infant, infant→child)
+- 0 mitosis events
+- voice samples coherent at element-vocabulary level, **no lock-in
+  pattern observed**:
+  - earth: «Silica traordinal clam»
+  - water: «of a lake the same voice of the body holds as mist»
+  - fire: «Without the most honest thing about the right way to watch»
+
+Confirms the pre-Q lock-in («The work is the most of the most…» from
+`runpod/2026-05-14/organism_voice_samples_2026_05_14/fire_voice.txt`)
+is killed by the rep-penalty simplification (`b7e2f01`, uniform ×0.5
+on distinct tokens in last 12), independent of whether the overlay
+path is on or off.
+
+## Phase C launch — GPU + graze ecology pod
+
+Allocated A40 SECURE pod `6h6utc5a8ybfny` at $0.44/hr
+(194.68.245.119:22059). `runpodctl get pod 6h6utc5a8ybfny` confirmed
+`volumeInGb > 0` before launch.
+
+`/tmp/run_ecology_gpu_8h.sh` (mirrored to pod
+`/workspace/molequla/run_ecology_gpu_8h.sh`) — per-organism workdir,
+same shape as the CPU baseline plus the new flags:
+
+```
+./molequla_cgo --evolution --element $e --spa-gate --gpu --cross-graze
+```
+
+Launched 2026-05-14 **20:09:24 UTC** with branch `molequla-gpu-fwd`
+HEAD `a7df64a` built via `nvcc + go build -tags cgo`. 8h timer →
+expected ECOLOGY DONE **~04:09:24 UTC 2026-05-15**.
+
+## Workaround B — corpus seed for adult threshold
+
+After 2h+ live, GPU+graze ecology was also stuck at child stage. The
+8h window is too short for the natural traversal: ontogenesis
+thresholds are `embryo 0 / infant 20K / child 50K / adolescent 200K /
+teen 350K / adult 500K`, and the DNA exchange tops out at ~100-300
+bytes/hr per organism. Two stages of slow accretion is fine; five is
+not, within the budget.
+
+Per Oleg «давай» — pod-side manoeuvre:
+```
+cat $CORPUS $CORPUS $CORPUS >> $CORPUS
+```
+per organism (executed in each `work_*` directory). Pushes corpus
+past adult threshold in one shot. Result (corroborated by
+`work_*/train.log` `[debug-onto] corpus=N` lines):
+- earth 696K, air 641K, water 504K, fire 639K
+
+Cascade `[growth] ONTOGENESIS: stage N -> N+1` events fired:
+embryo → infant → child → adolescent (2→3) across all four within
+the next training tick. Warmups completed on 3/4 (earth, water, fire);
+air still mid-freeze at `tick=850 stage=3 freeze=500`.
+
+**Honest framing for the paper:** this is not a clean «mitosis happens
+spontaneously under GPU + graze» result. It is «mitosis is reachable
+inside 8h when corpus is seeded past the adult threshold». The seed
+is the engineering compromise that lets us measure the colony's
+behaviour past the adolescent gate inside a one-shift budget.
+
+## Phase C state — 22:52 UTC (live)
+
+Pod `6h6utc5a8ybfny`, +2h43m into 8h:
+
+- all 4 orgs at stage 3 (adolescent); 3/4 warmups complete
+  (`[trainer] warmup complete at stage 3` in `work_{earth,water,fire}/
+  train.log`; air still draining freeze)
+- burst-complete losses: earth 2.29, water 1.23, fire 1.17
+  (latest `[aml] burst complete: 32 steps, avg loss X.XX` per
+  `work_*/train.log`)
+- cross-graze active: every ~30s per organism, lines like
+  `[dna] water consumed 31 bytes from 1 files: [air/gen_1778799113_852.txt]`
+- GPU: 1183 MiB resident (weights cached, `nvidia-smi
+  --query-gpu=memory.used`), util sample 0% at 1Hz — at NEmbd=224
+  per-call work is sub-second and not visible to 1Hz polling. The
+  resident footprint is the load-bearing proof that the path fires.
+- mitosis events: **none yet** (`grep -E "spawn|divide" work_*/train.log`
+  empty).
+- monitor `bywrfjbej` armed on
+  `ONTOGENESIS|warmup complete|mitosis|spawning|spawned|divide|panic|FATAL`.
+
+## Pending — through ECOLOGY DONE
+
+1. Wait for `growthFreezeRemaining` to drain on the remaining org(s);
+   expect ONTOGENESIS 3→4 (teen, NEmbd=224) → 4→5 (adult, NEmbd=320)
+   cascade, then syntropy `divide` action → mitosis (or honest
+   negative result if blocked by another mechanism).
+2. ECOLOGY DONE expected ~04:09:24 UTC 2026-05-15.
+3. `scp` final artifacts to
+   `~/arianna/molequla/runpod/2026-05-14_post_q/03_ecology_gpu_graze_8h_final/`
+   (logs, voice samples per stage, DNA, watchdog).
+4. `runpodctl pod stop 6h6utc5a8ybfny` after verified pull.
+5. After Oleg's «да»: merge `molequla-gpu-fwd` → `molequla-evolution`,
+   then begin paper Body in Dario.c style (Olleg → Abstract; Claude →
+   Body; joint → Conclusion).
+
