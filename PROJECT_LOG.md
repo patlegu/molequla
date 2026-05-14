@@ -778,3 +778,131 @@ corpus in 5 min). Each cell now has its exact CLI invocation listed.
 to pod boot, Oleg's call). CLI fix not yet committed — will land
 in a follow-up commit on `molequla-evolution` together with the
 final plan revision.
+
+---
+
+## 2026-05-14 — Phase 0.1 PASS on polygon (free)
+
+Quick build verify on polygon (Tailscale `100.127.195.24`, Linux
+6.17.0-19-generic Ubuntu, x86_64) before billing:
+
+- `git fetch + checkout molequla-evolution` — clean pull.
+- `cd ariannamethod && make clean && make` — PASS. `libaml.so` 189992 bytes
+  (USE_BLAS openblas-pthread). Linux differs from neo (libaml.dylib
+  246800 bytes on macOS Accelerate) — same source code, different
+  output target.
+- `CGO_ENABLED=1 go build -tags cgo` — PASS. `molequla_cgo` 9.7 MB.
+  Compiler note about calloc allocation (informational, not error).
+
+Phase 0.2/0.3 polygon smoke skipped per Oleg «не считай копейки,
+сразу на pod». Single-organism smoke duplicated by Phase 0.5 on the
+pod anyway.
+
+---
+
+## 2026-05-14 03:05 UTC — Pod boot (Singularity execution start)
+
+Boot via polygon `runpodctl pod create`:
+
+```
+--name molequla-coherence-2026-05-14
+--compute-type cpu
+--image ubuntu:24.04
+--container-disk-in-gb 30
+--volume-in-gb 10  (got 0 — see below)
+--ports 22/tcp
+```
+
+**Pod allocation (cheapest CPU spot RunPod found):**
+
+| Field | Value |
+|---|---|
+| ID | `8wsu2x15efp8z8` |
+| Cost/hr | $0.07 |
+| vCPU | 2 (asked 16, got cheapest spot) |
+| Memory | 4 GB |
+| Container disk | 30 GB |
+| **`volumeInGb`** | **0** ⚠️ |
+| Location | EU-RO-1 (secure cloud) |
+| Image | ubuntu:24.04 |
+| Status | RUNNING |
+
+**Critical: `volumeInGb=0`.** Per `memory/feedback_pod_stop_volume_zero_artifact_loss_2026_05_09.md` — `runpodctl pod stop` on a volume-zero pod **wipes the container disk**. All artifacts MUST be `scp`'d to polygon/neo (or pushed to git) BEFORE any stop/terminate. No `pod stop` mid-run.
+
+**Resource note:** 2 vCPU / 4 GB is significantly smaller than the
+Feb 2026 Oracle Cloud baseline (30-core / 216 GB,
+`molequla/README.md:75-94`). Plan v1.1's 4-organism ecology cell (4
+parents + potential children) may strain on 4 GB. May need to
+downscale ecology to 2 organisms if RSS approaches limit.
+
+**SSH endpoint:** pod-side ssh daemon takes ~2-3 min to come up after
+boot. Currently `error: "pod not ready"`. Polling.
+
+Singularity Mode active per Oleg «врубай сингулярити». Internal
+review tool invocations (codex, etc.) authorized without per-call
+confirmation. Three-strikes rule per `memory/protocol_singularity_mode_2026_05_08.md`.
+
+---
+
+## 2026-05-14 — CPU pod replaced with A100 SXM (more headroom)
+
+First CPU pod (`t872dhawmtl4hr`) had 2 vCPU / 4 GB RAM — sufficient
+for single-organism MVP but not for the 4-organism ecology cell in
+plan v1.1 (4 × ~2 GB RSS ≈ 8 GB needed). Oleg: «бери A100, разница в
+цене ничтожна», and clarified molequla README's «runs on CPU» is
+CPU/GPU-agnostic framing, not «CPU-only» — Feb 2026 measurement was
+on A100 anyway.
+
+Deleted CPU pod (~5 min uptime, ~$0.006). Spun A100 SXM.
+
+**A100 SXM pod:**
+
+| Field | Value |
+|---|---|
+| ID | `pqp86pfbfy9wo9` |
+| Cost/hr | $1.49 |
+| vCPU | 16 |
+| RAM | 250 GB |
+| Volume | **50 GB** (volumeInGb=50, persistent — stop safe) |
+| GPU | 1 × NVIDIA A100-SXM4-80GB (not used; CPU side-effect benefit) |
+| Location | EU-RO-1 |
+| Image | runpod/pytorch:2.1.0-py3.10-cuda11.8.0-devel-ubuntu22.04 |
+| SSH | `root@154.54.102.42:11914` via polygon `~/.ssh/id_ed25519_polygon` |
+
+Pod setup completed:
+- Go 1.22.5 installed (apt's 1.18 too old for module).
+- openblas-dev installed.
+- `git clone -b molequla-evolution` into `/workspace/molequla`.
+- `make` PASS, `libaml.so` 189992 bytes.
+- `CGO_ENABLED=1 go build -tags cgo` PASS, `molequla_cgo` 9.7 MB.
+
+---
+
+## 2026-05-14 03:24:47 UTC — Sweep started (background on pod)
+
+**`sweep.sh` (~50 LOC, copied to `/workspace/molequla/sweep.sh`)**
+runs two cells sequentially:
+
+- **cell_0_baseline:** 4 organisms (earth/air/water/fire) in
+  evolution mode, no Phase B flags. DUR=600s.
+- **cell_3_full_coherence:** same 4 organisms with
+  `--spa-gate --corpus-overlay`. DUR=600s.
+
+Each organism in own `cell_<X>/work_<e>/` dir with own corpus
+(`nonames_<e>.txt`), db, ckpt, and `train.log`. Sweep kills all
+organisms with `pkill -f molequla_cgo` between cells.
+
+Summary line per organism after each cell:
+`<label>/<e>: lines=N dna=N spa-gate=N mitosis=N last=stage=X`.
+
+**Process check 03:24:47:** sweep.sh + 4 organisms running, 6
+processes total. Log header confirms `cell_0_baseline flags=''
+DUR=600s` started.
+
+**Expected timeline:**
+- 03:24:47 → 03:34:47 cell 0 baseline running.
+- 03:34:50 → 03:44:50 cell 3 full coherence running.
+- 03:44:55 → ALL DONE.
+
+**Wakeup scheduled** ~25 min from now to check final results,
+archive logs to git, decide ecology cell extension or wrap-up.
