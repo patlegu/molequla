@@ -1517,3 +1517,29 @@ churn + destiny cost compound over ~10⁷ tokens in a 6-hour ecology),
 
 Awaiting Oleg call.
 
+### Plan v2 update — GPU resume + 8h + watchdog (commit pending)
+
+Oleg correction 2026-05-14 PM («почему опять кпу бля если в тот раз
+гпу частично но использовалось?»). Plan v1 ran on A100 SXM
+`pqp86pfbfy9wo9` ($1.49/hr per `runpod/2026-05-14/SUMMARY.md:3`); v2
+draft mistakenly switched to CPU envelope based on README's
+«CPU-only by design» framing. Corrected: resume same A100 GPU pod,
+keep CUDA wire from strike 3 (commit `34db1d4` `gpu_init()` call,
+bursty 73% util per `memory/reference_cgo_cuda_wire_2026_05_14.md`).
+Cost envelope: $1.49 × ~8.5h ≈ $13 total.
+
+Phase 2 ecology duration: 90 min → 8 h (480 min). Mitosis baseline
+48 min (Feb 2026 Oracle Cloud); 90 min on 16-vCPU got `mit=0`; 8 h ≈
+10× baseline. Pass criterion updated to require ≥1 mitosis OR
+explicit «structurally blocked past 3h» finding.
+
+`pod_watchdog.sh` added at repo root — bash poll loop (30s) that
+emits one stdout line per FAIL/HEARTBEAT_STALE/RSS_HIGH/DEAD/DISK_LOW
+event. From neo: `tail -F watchdog.log | grep --line-buffered`
+through Monitor tool gives per-event chat notifications without
+polling.
+
+Codex audit on plan v2 update + watchdog: two findings (PID file
+path mismatch, 90-min vs 8h pass criterion mismatch), both folded
+in same commit. Final codex pass clean.
+

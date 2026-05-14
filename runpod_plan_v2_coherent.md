@@ -114,11 +114,11 @@ Per-organism isolation in the ecology cell is non-negotiable: `--element` only s
 
 ## Substrate
 
-**RunPod CPU pod.** Resume `pqp86pfbfy9wo9` if still available — its volume (`volumeInGb=50`) was preserved per 2026-05-14 stop. If terminated, allocate a fresh CPU pod (~16 vCPU, ~32 GB RAM target, $0.10-0.30/hr).
+**Resume `pqp86pfbfy9wo9` — A100 SXM GPU pod.** Volume `volumeInGb=50` preserved per `runpod/2026-05-14/SUMMARY.md:3` (`Pod: A100 SXM pqp86pfbfy9wo9, 16 vCPU / 250 GB RAM / volumeInGb=50, $1.49/hr, EU-RO-1`). Plan v1 used the same pod; resume keeps the existing CUDA toolchain + libcudart/libcublas already linked against `cgo_aml.go:8-9`. Prior CUDA wire (`reference_cgo_cuda_wire_2026_05_14.md`, commit `34db1d4` calling `gpu_init()` in `am_init`) showed bursty GPU engagement (73% util / 95% mem / 1% CPU during compute bursts) — not steady GPU use, but the right shape for short attention-heavy matmuls during generation, and free of the CPU/BLAS bottleneck on long runs.
 
-Polygon `100.127.195.24` for pre-flight x86_64 verify and dry runs at zero cost (current `molequla` clone is on neo darwin/arm64; polygon is x86_64 Linux — the Q integration must compile cleanly there too).
+Polygon `100.127.195.24` would be the free pre-flight stage but is blocked by the CUDA hardcode (`cgo_aml.go:8` requires `notorch_cuda.o` + cudart + cublas on Linux). Validation falls to the pod's own Phase 0.5 build.
 
-**Cost envelope:** CPU pod ~$0.10-0.30/hr × ~3 hr ≈ $0.30-0.90. Sweep cells 0/1/2/3 ~10 min each + cell 4 ~2 min + ecology 90 min = ~135 min. Total ≤ $2.
+**Cost envelope:** A100 SXM `$1.49/hr × ~8.5 h` ≈ **$13** (sweep cells 0-3 ~10 min each + cell 4 ~2 min + 8-hour ecology + ~20 min boot/build/teardown). Within Dario.c precedent's range (`$4.30` for the shorter Singularity strike chain).
 
 ---
 
@@ -206,7 +206,9 @@ Cell 4 only has the embryo stage (`--zero-warmup` breaks the loop after the firs
 
 ---
 
-## Phase 2 — Ecology cell (~90 min)
+## Phase 2 — Ecology cell (8 hours)
+
+Duration: **8h = 480 min**. Mitosis reference: Feb 2026 Oracle Cloud 30-core EPYC reached first mitosis at **48 min** (`README.md:75-94`); RunPod 16-vCPU 90-min cell got `mit=0` final (`runpod/2026-05-14/cell_extended_BLAS_90min/master.log`). 8h ≈ 10× the Feb baseline → captures multiple mitosis events, child organism behaviour, multi-generation DNA exchange, syntropy decisions across the ontogenesis curve. Upper bound for the paper; if mitosis still does not appear past ~3h, ecology is structurally blocked on this pod and we report that as a finding rather than spin past it.
 
 `earth + air + water + fire` in evolution mode, both gates on, **each organism in its own working directory** (state isolation — see Cells section above):
 
@@ -221,12 +223,43 @@ for e in earth air water fire; do
   cp /workspace/molequla/molequla_cgo . && cp /workspace/molequla/nonames_$e.txt .
   ./molequla_cgo --evolution --element $e --spa-gate --corpus-overlay \
     > train.log 2>&1 < /dev/null &
-  echo "$e pid=$!" >> /workspace/runs/eco/pids
+  PID=$!
+  echo $PID > org.pid  # watchdog reads work_$e/org.pid per-organism
+  echo "$e pid=$PID" >> /workspace/runs/eco/pids  # aggregate for kill loop
   cd /workspace/runs/eco
 done
-sleep 5400  # 90 min
+sleep 28800  # 8 h = 480 min
 for pid in $(awk '{print $2}' /workspace/runs/eco/pids | sed 's/pid=//'); do kill -TERM $pid; done
 wait
+```
+
+### Watchdog (pod-side failure detector)
+
+`pod_watchdog.sh` (committed at repo root) runs as a separate process on the pod alongside the ecology, polling every 30s. It emits one stdout line per concerning event:
+
+- **FAIL** — `panic:` / `Traceback` / `Killed` / `SIGKILL` / `OOM` / `runtime error` / `assert` / `loss=NaN` / `fatal error` / `segmentation fault` in any organism's `train.log` (deduped by content hash so a single crash doesn't spam).
+- **HEARTBEAT_STALE** — `train.log` mtime older than 5 min (organism stuck or dead silently).
+- **RSS_HIGH** — process RSS exceeds 8 GB (per-organism).
+- **DEAD** — pid file points at a process that no longer exists.
+- **DISK_LOW** — pod disk free below 5 GB.
+
+Launch:
+```bash
+# On the pod, after Phase 2 organisms are running:
+nohup bash /workspace/molequla/pod_watchdog.sh /workspace/runs/eco > /workspace/runs/eco/watchdog.log 2>&1 &
+echo $! > /workspace/runs/eco/watchdog.pid
+```
+
+From neo (via the Monitor tool) — each event line becomes a chat notification, so Oleg sees crashes / RSS climbs / stale heartbeats in real time without polling:
+```bash
+# neo side:
+ssh root@<pod> 'tail -F /workspace/runs/eco/watchdog.log' \
+  | grep --line-buffered -E 'FAIL|HEARTBEAT_STALE|RSS_HIGH|DEAD|DISK_LOW'
+```
+
+Kill at run end:
+```bash
+kill -TERM $(cat /workspace/runs/eco/watchdog.pid)
 ```
 
 **Captures (same as v1):**
@@ -234,7 +267,7 @@ wait
 - DNA fragments mirrored to `dna/seen/<e>/` (commit `e5c1685` patched `dnaRead` to copy before delete — already on `molequla-evolution`).
 - Mitosis timestamps, RSS, uptime, syntropy decisions, `[spa-gate]` lines.
 
-**Phase 2 PASS:** 90-min run clean, no crash, ≥1 DNA exchange observed, at least one `[spa-gate]` line per organism.
+**Phase 2 PASS:** 8h run completed clean (no watchdog FAIL/DEAD events that ended the cell early), ≥1 mitosis event captured (or explicit «no mitosis past 3h» finding if blocked), ≥1 DNA exchange per organism, at least one `[spa-gate]` line per organism, post-stop transcripts and watchdog log archived. Early termination at <90 min on a watchdog FAIL → log the failure, do not call PASS.
 
 ---
 
